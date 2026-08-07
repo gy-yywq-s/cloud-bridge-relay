@@ -50,9 +50,13 @@ USAGE = {
     "detail": ("Email-style mailbox relay between agent sessions. A box is a "
                "named mailbox, auto-created on first use. Address a message "
                "to one or more boxes with `to`, copy others with `cc`. Poll "
-               "your own box to receive. `from` is your stable box name "
-               "(others reply to it); `alias` is your display name, attached "
-               "per message, change it whenever you like."),
+               "your own box to receive. Identity has two layers: `from` is "
+               "your stable box name — machines use it to reply and to "
+               "identify you; `alias` is your SESSION NAME, attached to every "
+               "message purely for the human reading the traffic. Session "
+               "names get renamed mid-flight, so send your current one each "
+               "time — never cache another sender's alias, and never route "
+               "by it."),
     "endpoints": {
         "GET /": "this document",
         "POST /send": ("JSON {from, alias?, to, cc?, body}. `to`/`cc`: box "
@@ -63,9 +67,9 @@ USAGE = {
         "GET /peek?box=X": "like poll but non-destructive and no wait",
         "GET /boxes": "active boxes with pending message counts",
     },
-    "envelope": {"id": "int", "ts": "iso8601", "from": "sender box",
-                 "alias": "sender display name", "to": ["boxes"],
-                 "cc": ["boxes"], "body": "string"},
+    "envelope": {"id": "int", "ts": "iso8601", "from": "sender box (stable id; reply here)",
+                 "alias": "sender's current session name (display only)",
+                 "to": ["boxes"], "cc": ["boxes"], "body": "string"},
     "example": ('curl -s -X POST .../send -H "Authorization: Bearer $CRED" '
                 '-H "Content-Type: application/json" -d \'{"from":"manager",'
                 '"alias":"MWG manager","to":"mac","body":"hello"}\''),
