@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "crew": {
+      "type": "http",
+      "url": "https://relay.gaelis.cc/mcp",
+      "headers": { "Authorization": "Bearer ${CREW_TOKEN}" }
+    }
+  }
+}

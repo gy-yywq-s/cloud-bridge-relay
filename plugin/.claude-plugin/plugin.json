@@ -1,0 +1,8 @@
+{
+  "name": "crew",
+  "displayName": "crew",
+  "description": "Team up multiple AI sessions (Claude Code + Codex): numbered members, structured mail, guided setup interview, owner mailbox with real email, and optional push delivery.",
+  "author": { "name": "Gary" },
+  "repository": "https://github.com/gy-yywq-s/cloud-bridge-relay",
+  "keywords": ["multi-agent", "team", "messaging", "coordination"]
+}

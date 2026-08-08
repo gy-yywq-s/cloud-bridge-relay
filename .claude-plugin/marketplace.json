@@ -1,0 +1,11 @@
+{
+  "name": "gaelis",
+  "owner": { "name": "Gary" },
+  "plugins": [
+    {
+      "name": "crew",
+      "source": "./plugin",
+      "description": "Team up multiple AI sessions: shared mailboxes, roles, owner email, guided setup."
+    }
+  ]
+}
