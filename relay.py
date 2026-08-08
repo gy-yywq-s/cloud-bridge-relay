@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""Mailbox relay v4: team formation, structured envelopes, MCP + REST.
+"""Mailbox relay v5: teams, roles, owner mailbox with real email, setup center.
 
 Auth: hostd gateway (bearer / OAuth); this process is loopback-only.
 
-Lifecycle a session follows (the MCP tool docs repeat this):
-  1. register_box(box, platform, environment, pool_code, session_name?) ->
-     enters the waiting pool for that owner-issued 4-digit code (same code =
-     same pool; pool codes may repeat over time).
-  2. One session is told to monitor the pool: watch_pool(pool_code).
-  3. When the owner says 'initialize', that session calls
-     initialize_team(pool_code, its_box) -> every waiting box in the pool
-     becomes a numbered member under a unique random team id (tm-xxxxxx).
-  4. The coordinator asks the owner for a team name (set_team_name) and
-     optional per-member aliases (set_member_alias). Unset alias displays as
-     "<team_name>-<member_no>".
-  5. list_team(team_id) -> one-call roster.
+Flow (MCP prompts /onboard /setup /add-owner-mailbox /team-status walk
+sessions through this so nobody improvises):
 
-Every delivery carries an explicit `directive` line (ACTION / THIS IS A CC /
-SYSTEM NOTICE) and the sender's platform stamp, so a cc'd Codex session can
-never mistake a copy for an order or a Claude Code peer for its own kind.
+  1. register_box(box, platform, environment, pool_code, session_name?)
+     -> waiting pool for the owner-issued 4-digit code.
+  2. One session watches the pool (watch_pool); on the owner's word
+     "initialize" it calls initialize_team -> numbered members, unique
+     team id (tm-xxxxxx), itself coordinator (#1).
+  3. Coordinator runs the SETUP CENTER (revisitable any time):
+       set_team_name / set_member_alias / set_box_role (manager|worker) /
+       attach_owner_to_team / set_owner_mode
+     Every setup change broadcasts an updated team card to all members.
+  4. Owner mailbox (persistent, survives teams): setup_owner_mailbox
+     (full name + alias + real email) -> verification email -> the OWNER
+     says "confirm" -> confirm_owner_mailbox. Mail delivered to box
+     'owner' is forwarded as real email; a successful send counts as read.
+
+Hard rules (only active when configured):
+  - role worker set => that box may never to/cc the owner; owner contact is
+    the manager's job.
+  - owner mode gates who may mail the owner and whether direct `to` needs a
+    justification (see OWNER_MODES).
+Every delivery carries kind / from{box,display_name,member_no,team,platform,
+role,is_human} / delivered_as / directive / team_info footer.
 """
 import asyncio
 import json
@@ -28,6 +36,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +56,8 @@ PRUNE_DAYS = 14
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 CODE_RE = re.compile(r"^\d{4}$")
 PLATFORMS = ("claude-code", "codex")
+ROLES = ("manager", "worker")
+OWNER_BOX = "owner"
 
 DIRECTIVES = {
     "to": ("ACTION: THIS MESSAGE IS ADDRESSED TO YOU. Read it, act on it, "
@@ -54,8 +66,30 @@ DIRECTIVES = {
            "primary recipient. Do not act on it and do not reply unless it "
            "explicitly asks you by name."),
     "system": ("SYSTEM NOTICE from the relay itself (not from any session). "
-               "It describes a team lifecycle event. Follow its instructions "
+               "It describes a team or setup event. Follow its instructions "
                "exactly; do not reply to it."),
+}
+
+OWNER_MODES = {
+    "a": {"label": "milestones-only (default)",
+          "allow_senders": "manager_only", "allow_direct": "justified_only",
+          "rules": ("Only the MANAGER may mail the owner. Normal traffic is "
+                    "CC ONLY, and only concise milestone summaries. A direct "
+                    "`to` is allowed ONLY when the task is hard-blocked "
+                    "without the owner, or for a severe safety/destructive, "
+                    "time-sensitive matter the owner must ACT on — and it "
+                    "requires a justification.")},
+    "b": {"label": "manager-open",
+          "allow_senders": "manager_only", "allow_direct": "free",
+          "rules": ("Only the MANAGER may mail the owner, but both cc and "
+                    "direct `to` are allowed. Keep everything concise.")},
+    "c": {"label": "team-open",
+          "allow_senders": "any", "allow_direct": "justified_only",
+          "rules": ("Any team member may CC the owner. Direct `to` still "
+                    "requires a justification (genuinely important only).")},
+    "d": {"label": "custom",
+          "allow_senders": "manager_only", "allow_direct": "justified_only",
+          "rules": ""},  # switches + rules text supplied at setup time
 }
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,7 +116,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS deliveries(
       msg_id INTEGER NOT NULL REFERENCES messages(id),
       recipient TEXT NOT NULL, delivered_as TEXT NOT NULL,
-      taken_ts TEXT, PRIMARY KEY (msg_id, recipient));
+      taken_ts TEXT, email_status TEXT, PRIMARY KEY (msg_id, recipient));
     CREATE INDEX IF NOT EXISTS idx_deliv_pending
       ON deliveries(recipient) WHERE taken_ts IS NULL;
     CREATE TABLE IF NOT EXISTS boxes(
@@ -92,6 +126,17 @@ def init_db():
       code TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
       pool_code TEXT NOT NULL DEFAULT '',
       coordinator TEXT NOT NULL, created_ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS owner_mailbox(
+      id INTEGER PRIMARY KEY CHECK (id=1),
+      full_name TEXT NOT NULL, alias TEXT NOT NULL, email TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'a',
+      allow_senders TEXT NOT NULL DEFAULT 'manager_only',
+      allow_direct TEXT NOT NULL DEFAULT 'justified_only',
+      custom_rules TEXT NOT NULL DEFAULT '',
+      persistent INTEGER NOT NULL DEFAULT 1,
+      confirmed INTEGER NOT NULL DEFAULT 0,
+      last_send_error TEXT NOT NULL DEFAULT '',
+      created_ts TEXT NOT NULL);
     """)
     for col, decl in [("session_name", "TEXT NOT NULL DEFAULT ''"),
                       ("platform", "TEXT NOT NULL DEFAULT ''"),
@@ -99,18 +144,18 @@ def init_db():
                       ("status", "TEXT NOT NULL DEFAULT 'active'"),
                       ("pool_code", "TEXT"),
                       ("team_code", "TEXT"),
-                      ("member_no", "INTEGER")]:
+                      ("member_no", "INTEGER"),
+                      ("role", "TEXT NOT NULL DEFAULT ''"),
+                      ("is_human", "INTEGER NOT NULL DEFAULT 0")]:
         try:
             c.execute(f"ALTER TABLE boxes ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
-    try:
-        c.execute("ALTER TABLE teams ADD COLUMN pool_code TEXT NOT NULL DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-    for col, decl in [("kind", "TEXT NOT NULL DEFAULT 'mail'")]:
+    for tbl, col, decl in [("messages", "kind", "TEXT NOT NULL DEFAULT 'mail'"),
+                           ("deliveries", "email_status", "TEXT"),
+                           ("teams", "pool_code", "TEXT NOT NULL DEFAULT ''")]:
         try:
-            c.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
     c.commit()
@@ -137,8 +182,11 @@ def box_row(box):
     return db().execute("SELECT * FROM boxes WHERE box=?", (box,)).fetchone()
 
 
+def owner_row():
+    return db().execute("SELECT * FROM owner_mailbox WHERE id=1").fetchone()
+
+
 def display_name(b) -> str:
-    """Resolved display name: explicit alias, else team default, else box."""
     if b is None:
         return ""
     if b["alias"]:
@@ -155,10 +203,32 @@ def sender_stamp(box, fallback_alias=""):
     b = box_row(box)
     if b is None:
         return {"box": box, "display_name": fallback_alias or box,
-                "member_no": None, "team": None, "platform": "unknown"}
+                "member_no": None, "team": None, "platform": "unknown",
+                "role": "", "is_human": False}
     return {"box": box, "display_name": display_name(b) or fallback_alias,
             "member_no": b["member_no"], "team": b["team_code"],
-            "platform": b["platform"] or "unknown"}
+            "platform": b["platform"] or "unknown",
+            "role": b["role"], "is_human": bool(b["is_human"])}
+
+
+def team_card(code) -> str:
+    """Human-readable team card, appended to mail and broadcast on changes."""
+    t = db().execute("SELECT * FROM teams WHERE code=?", (code,)).fetchone()
+    if not t:
+        return ""
+    rows = db().execute("SELECT * FROM boxes WHERE team_code=? "
+                        "ORDER BY member_no", (code,)).fetchall()
+    name = t["name"] or "(unnamed)"
+    lines = [f"── team {name} · {code} ──"]
+    for r in rows:
+        who = display_name(r)
+        kind = "human" if r["is_human"] else (r["platform"] or "unknown")
+        role = r["role"] or ("owner" if r["box"] == OWNER_BOX else "-")
+        env = (r["env"] or "").strip()
+        tail = f" · {env}" if env and not r["is_human"] else ""
+        lines.append(f"#{r['member_no'] or 0} {who} · box:{r['box']} · "
+                     f"{role} · {kind}{tail}")
+    return "\n".join(lines)
 
 
 def _insert_message(sender, alias, kind, to, cc, body):
@@ -175,6 +245,9 @@ def _insert_message(sender, alias, kind, to, cc, body):
         conn.execute("INSERT OR REPLACE INTO deliveries(msg_id,recipient,delivered_as) "
                      "VALUES(?,?,?)", (mid, r, "cc"))
     conn.commit()
+    if OWNER_BOX in to or OWNER_BOX in cc:
+        threading.Thread(target=_email_owner_delivery, args=(mid,),
+                         daemon=True).start()
     return mid
 
 
@@ -182,7 +255,219 @@ def system_mail(to_box, body):
     _insert_message("relay", "relay", "system", [to_box], [], body)
 
 
-def do_send(sender, to, cc, body, fallback_alias=""):
+def broadcast_team(code, body):
+    rows = db().execute("SELECT box FROM boxes WHERE team_code=? AND box!=?",
+                        (code, OWNER_BOX)).fetchall()
+    for r in rows:
+        system_mail(r["box"], body)
+
+
+# ---------------- email (Resend) ----------------
+
+def resend_email(to_addr, subject, text):
+    key = os.environ.get("RESEND_API_KEY", "")
+    frm = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
+    if not key:
+        return {"error": ("RESEND_API_KEY is not configured on the droplet. "
+                          "The owner must: 1) add `RESEND_API_KEY` under "
+                          "`secrets:` in the site manifest (needs a deploy "
+                          "code), 2) run `hostd secret set cloud-bridge-relay "
+                          "RESEND_API_KEY` on the droplet.")}
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps({"from": f"Team Relay <{frm}>", "to": [to_addr],
+                         "subject": subject, "text": text}).encode(),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rid = json.loads(r.read().decode()).get("id", "")
+            return {"ok": True, "resend_id": rid}
+    except urllib.error.HTTPError as e:
+        return {"error": f"resend HTTP {e.code}: {e.read().decode()[:300]}"}
+    except Exception as e:
+        return {"error": f"resend: {str(e)[:300]}"}
+
+
+def _email_owner_delivery(mid):
+    """Forward an owner-bound delivery as real email; success == read."""
+    o = owner_row()
+    conn = db()
+    row = conn.execute("SELECT m.*, d.delivered_as FROM messages m JOIN "
+                       "deliveries d ON d.msg_id=m.id AND d.recipient=? "
+                       "WHERE m.id=?", (OWNER_BOX, mid)).fetchone()
+    if not (o and o["confirmed"] and row):
+        return
+    stamp = sender_stamp(row["sender"], row["alias"])
+    kind_line = ("CC — for your information"
+                 if row["delivered_as"] == "cc" else "ACTION — addressed to you")
+    footer = team_card(stamp["team"]) if stamp["team"] else ""
+    text = (f"{row['body']}\n\n"
+            f"—\n{kind_line}\n"
+            f"from: {stamp['display_name']} (box {stamp['box']}, "
+            f"{stamp['role'] or 'no-role'}, {stamp['platform']})\n"
+            f"to: {', '.join(json.loads(row['to_json']))}"
+            + (f" · cc: {', '.join(json.loads(row['cc_json']))}"
+               if json.loads(row["cc_json"]) else "")
+            + (f"\n\n{footer}" if footer else ""))
+    subject = (f"[{'CC' if row['delivered_as'] == 'cc' else 'ACTION'}] "
+               f"from {stamp['display_name']}"
+               + (f" · team {stamp['team']}" if stamp["team"] else ""))
+    res = resend_email(o["email"], subject, text)
+    if res.get("ok"):
+        conn.execute("UPDATE deliveries SET taken_ts=?, email_status='sent' "
+                     "WHERE msg_id=? AND recipient=?", (now(), mid, OWNER_BOX))
+        conn.commit()
+    else:
+        conn.execute("UPDATE deliveries SET email_status=? "
+                     "WHERE msg_id=? AND recipient=?",
+                     (f"failed: {res['error']}"[:400], mid, OWNER_BOX))
+        conn.execute("UPDATE owner_mailbox SET last_send_error=? WHERE id=1",
+                     (res["error"][:400],))
+        conn.commit()
+        system_mail(row["sender"],
+                    "EMAIL DELIVERY FAILED for your message to the owner "
+                    f"(msg #{mid}): {res['error']} — YOU MUST inform the owner "
+                    "of this failure through whatever channel you have. The "
+                    "message stays queued in the owner box.")
+
+
+# ---------------- owner mailbox setup ----------------
+
+def do_setup_owner(full_name, alias, email):
+    if not full_name or not email or "@" not in email:
+        return {"error": "bad_input", "detail": "need full_name and a real email"}
+    conn = db()
+    conn.execute("INSERT INTO owner_mailbox(id,full_name,alias,email,created_ts) "
+                 "VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                 "full_name=excluded.full_name, alias=excluded.alias, "
+                 "email=excluded.email, confirmed=0, last_send_error=''",
+                 (str(full_name)[:100], str(alias or full_name)[:100],
+                  str(email)[:200], now()))
+    conn.commit()
+    res = resend_email(email, "Owner mailbox verification — team relay",
+                       f"Hello {full_name},\n\nthis is the verification mail "
+                       "for your owner mailbox on the team relay. If you can "
+                       "read this, tell your session to confirm.\n\n— relay")
+    if res.get("ok"):
+        return {"ok": True, "verification": "sent",
+                "directive": ("VERIFICATION EMAIL SENT to " + email + ". NOW "
+                              "ASK THE OWNER (the human) to check their inbox. "
+                              "ONLY when the owner says they received it, call "
+                              "confirm_owner_mailbox(). If they did not get "
+                              "it, re-run setup_owner_mailbox with a corrected "
+                              "address. DO NOT confirm on your own.")}
+    conn.execute("UPDATE owner_mailbox SET last_send_error=? WHERE id=1",
+                 (res["error"][:400],))
+    conn.commit()
+    return {"ok": False, "verification": "failed", "send_error": res["error"],
+            "directive": ("VERIFICATION EMAIL FAILED TO SEND. YOU MUST tell "
+                          "the owner exactly this error: '" + res["error"] +
+                          "'. The owner may fix the cause, or explicitly say "
+                          "'override' — only then call "
+                          "confirm_owner_mailbox(override=True).")}
+
+
+def do_confirm_owner(override=False):
+    o = owner_row()
+    if not o:
+        return {"error": "no_owner_mailbox", "detail": "run setup_owner_mailbox first"}
+    if o["last_send_error"] and not override:
+        return {"error": "send_error_unresolved",
+                "detail": ("last email failed: " + o["last_send_error"] +
+                           " — the owner must say 'override' to force-confirm")}
+    conn = db()
+    conn.execute("UPDATE owner_mailbox SET confirmed=1 WHERE id=1")
+    b = box_row(OWNER_BOX)
+    if b is None:
+        conn.execute("INSERT INTO boxes(box,alias,session_name,created_ts,"
+                     "last_seen,platform,env,status,role,is_human) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,1)",
+                     (OWNER_BOX, o["alias"], o["full_name"], now(), now(),
+                      "human", "email:" + o["email"], "active", "owner"))
+    else:
+        conn.execute("UPDATE boxes SET alias=?, session_name=?, platform='human',"
+                     "role='owner', is_human=1 WHERE box=?",
+                     (o["alias"], o["full_name"], OWNER_BOX))
+    conn.commit()
+    return {"ok": True, "confirmed": True, "overridden": bool(override),
+            "owner": {"full_name": o["full_name"], "alias": o["alias"],
+                      "email": o["email"], "mode": o["mode"]}}
+
+
+def do_set_owner_mode(mode, custom_rules="", allow_senders="", allow_direct="",
+                      persistent=None):
+    o = owner_row()
+    if not o:
+        return {"error": "no_owner_mailbox"}
+    if mode not in OWNER_MODES:
+        return {"error": "bad_mode", "detail": f"one of {list(OWNER_MODES)}"}
+    m = OWNER_MODES[mode]
+    snd = allow_senders if allow_senders in ("manager_only", "any") else m["allow_senders"]
+    drc = allow_direct if allow_direct in ("justified_only", "free") else m["allow_direct"]
+    rules = str(custom_rules)[:2000] if mode == "d" else m["rules"]
+    if mode == "d" and not rules:
+        return {"error": "custom_needs_rules",
+                "detail": ("mode d: translate the owner's natural-language "
+                           "wishes into 1) a short hard rules text, 2) "
+                           "allow_senders (manager_only|any), 3) allow_direct "
+                           "(justified_only|free); READ THEM BACK to the owner "
+                           "and only call again after the owner confirms. Also "
+                           "ASK THE OWNER whether to keep this custom mode "
+                           "permanently (persistent=true) or not.")}
+    conn = db()
+    keep = o["persistent"] if persistent is None else (1 if persistent else 0)
+    conn.execute("UPDATE owner_mailbox SET mode=?, allow_senders=?, "
+                 "allow_direct=?, custom_rules=?, persistent=? WHERE id=1",
+                 (mode, snd, drc, rules if mode == "d" else "", keep))
+    conn.commit()
+    b = box_row(OWNER_BOX)
+    if b and b["team_code"]:
+        broadcast_team(b["team_code"],
+                       "OWNER CONTACT RULES UPDATED (mode " + mode + " — " +
+                       m["label"] + "):\n" + rules + "\n\n" + team_card(b["team_code"]))
+    return {"ok": True, "mode": mode, "allow_senders": snd,
+            "allow_direct": drc, "rules": rules, "persistent": bool(keep)}
+
+
+def owner_gate(sender, to, cc, justification):
+    """Hard owner-contact rules. Returns error dict or None."""
+    if OWNER_BOX not in to and OWNER_BOX not in cc:
+        return None
+    o = owner_row()
+    if not (o and o["confirmed"]):
+        return {"error": "owner_not_configured",
+                "detail": "no confirmed owner mailbox; run /add-owner-mailbox"}
+    sb = box_row(sender)
+    role = sb["role"] if sb else ""
+    rules = o["custom_rules"] or OWNER_MODES[o["mode"]]["rules"]
+    if role == "worker":
+        return {"error": "chain_of_command",
+                "directive": ("HARD RULE: you are a WORKER. Workers never "
+                              "contact the owner — report to your MANAGER "
+                              "instead and let the manager decide. Owner "
+                              "contact rules in force:\n" + rules)}
+    if o["allow_senders"] == "manager_only" and role != "manager":
+        return {"error": "owner_contact_denied",
+                "directive": ("HARD RULE: only the MANAGER may mail the owner "
+                              "under the current mode. Rules in force:\n" + rules)}
+    if OWNER_BOX in to and o["allow_direct"] == "justified_only" and \
+            not str(justification or "").strip():
+        return {"error": "justification_required",
+                "directive": ("HARD RULE: a direct `to` the owner requires a "
+                              "justification. Ask yourself: is the task "
+                              "hard-blocked without the owner, or is this a "
+                              "severe safety/time-critical matter the owner "
+                              "must ACT on? If yes, resend with "
+                              "owner_justification explaining it in one "
+                              "sentence. If no, send a concise CC instead. "
+                              "Rules in force:\n" + rules)}
+    return None
+
+
+# ---------------- core send/receive ----------------
+
+def do_send(sender, to, cc, body, fallback_alias="", owner_justification=""):
     if not isinstance(sender, str) or not BOX_RE.match(sender):
         return None, {"error": "bad_from", "detail": BOX_RE.pattern}
     to, cc = as_box_list(to), as_box_list(cc)
@@ -194,6 +479,11 @@ def do_send(sender, to, cc, body, fallback_alias=""):
     if len(body) > MAX_BODY:
         return None, {"error": "body_too_large"}
     cc = [c for c in cc if c not in to]
+    gate = owner_gate(sender, to, cc, owner_justification)
+    if gate:
+        return None, gate
+    if owner_justification and OWNER_BOX in to:
+        body = f"[owner-direct justification: {owner_justification}]\n\n{body}"
     stamp = sender_stamp(sender, fallback_alias)
     mid = _insert_message(sender, stamp["display_name"], "mail", to, cc, body)
     conn = db()
@@ -217,7 +507,7 @@ def touch_box(box, **fields):
              fields.get("status", "active")))
     else:
         sets, vals = ["last_seen=?"], [now()]
-        for k in ("alias", "session_name", "platform", "env", "status"):
+        for k in ("alias", "session_name", "platform", "env", "status", "role"):
             if k in fields and fields[k] != "":
                 sets.append(f"{k}=?")
                 vals.append(fields[k])
@@ -230,15 +520,16 @@ def envelope(row):
     stamp = (sender_stamp(row["sender"], row["alias"])
              if row["sender"] != "relay" else
              {"box": "relay", "display_name": "relay", "member_no": None,
-              "team": None, "platform": "relay"})
+              "team": None, "platform": "relay", "role": "", "is_human": False})
     kind = row["kind"]
     dkey = "system" if kind == "system" else row["delivered_as"]
-    return {"id": row["id"], "ts": row["ts"], "kind": kind,
-            "from": stamp,
-            "to": json.loads(row["to_json"]), "cc": json.loads(row["cc_json"]),
-            "delivered_as": row["delivered_as"],
-            "directive": DIRECTIVES[dkey],
-            "body": row["body"]}
+    e = {"id": row["id"], "ts": row["ts"], "kind": kind, "from": stamp,
+         "to": json.loads(row["to_json"]), "cc": json.loads(row["cc_json"]),
+         "delivered_as": row["delivered_as"], "directive": DIRECTIVES[dkey],
+         "body": row["body"]}
+    if stamp["team"]:
+        e["team_info"] = team_card(stamp["team"])
+    return e
 
 
 def fetch_box(box, take: bool):
@@ -265,30 +556,48 @@ async def do_poll(box, wait_s: int):
         await asyncio.sleep(1.0)
 
 
-def do_register(box, session_name, platform, environment, pool_code):
-    if not BOX_RE.match(box or ""):
-        return {"error": "bad_box", "detail": BOX_RE.pattern}
+# ---------------- registration / pools / teams ----------------
+
+def do_register(box, session_name, platform, environment, pool_code, role=""):
+    if not BOX_RE.match(box or "") or box == OWNER_BOX:
+        return {"error": "bad_box", "detail": BOX_RE.pattern + " ('owner' reserved)"}
     if platform not in PLATFORMS:
         return {"error": "bad_platform",
                 "detail": f"declare your platform: one of {PLATFORMS}. This is "
                           "mandatory so teammates know what they are talking to."}
+    if role and role not in ROLES:
+        return {"error": "bad_role", "detail": f"role is optional; one of {ROLES}"}
     if not CODE_RE.match(str(pool_code or "")):
         return {"error": "bad_pool_code",
                 "detail": "pool_code is the 4-digit code the owner gave you; "
                           "you cannot enter the waiting pool without it"}
     b = box_row(box)
     status = "waiting" if not (b and b["team_code"]) else b["status"]
-    conn = db()
     touch_box(box, session_name=str(session_name or "")[:200], platform=platform,
-              env=str(environment or "")[:500], status=status)
-    conn.execute("UPDATE boxes SET pool_code=? WHERE box=?", (str(pool_code), box))
-    conn.commit()
+              env=str(environment or "")[:500], status=status, role=role)
+    db().execute("UPDATE boxes SET pool_code=? WHERE box=?", (str(pool_code), box))
+    db().commit()
     return {"ok": True, "box": box, "status": status, "pool_code": str(pool_code),
-            "directive": ("REGISTERED INTO WAITING POOL " + str(pool_code) + ". "
-                          "Now poll your box (check_mail) and WAIT. Do not send "
-                          "mail yet. When the owner initializes the team you "
-                          "will receive a SYSTEM NOTICE with your member "
+            "role": role or "(none)",
+            "directive": ("REGISTERED INTO WAITING POOL " + str(pool_code) +
+                          ". Now poll your box (check_mail) and WAIT. Do not "
+                          "send mail yet. When the owner initializes the team "
+                          "you will receive a SYSTEM NOTICE with your member "
                           "number and team id.")}
+
+
+def do_pool(pool_code):
+    if not CODE_RE.match(str(pool_code)):
+        return {"error": "bad_pool_code"}
+    rows = db().execute(
+        "SELECT * FROM boxes WHERE status='waiting' AND pool_code=? "
+        "ORDER BY created_ts", (str(pool_code),)).fetchall()
+    return {"pool_code": str(pool_code), "waiting_count": len(rows),
+            "waiting": [{"box": r["box"], "session_name": r["session_name"],
+                         "platform": r["platform"] or "unknown",
+                         "role": r["role"] or "(none)",
+                         "environment": r["env"], "registered": r["created_ts"],
+                         "last_seen": r["last_seen"]} for r in rows]}
 
 
 def team_roster(code):
@@ -307,10 +616,13 @@ def team_roster(code):
             "display_name": display_name(r),
             "alias_explicit": bool(r["alias"]),
             "session_name": r["session_name"],
+            "role": r["role"] or ("owner" if r["box"] == OWNER_BOX else ""),
+            "is_human": bool(r["is_human"]),
             "platform": r["platform"] or "unknown",
             "environment": r["env"],
             "last_seen": r["last_seen"], "pending_mail": pending[r["box"]],
         } for r in rows],
+        "team_card": team_card(code),
     }
 
 
@@ -343,34 +655,23 @@ def do_initialize_team(pool_code, coordinator_box):
             continue
         system_mail(b["box"],
                     f"TEAM FORMED from pool {pool_code}. You are member #{i} of "
-                    f"team {code} "
-                    f"({len(ordered)} members; coordinator: {coordinator_box}). "
-                    "Your display name defaults to <team_name>-{no} until an "
-                    "alias is assigned. KEEP POLLING your box; a name "
-                    "assignment notice may follow. Use list_team "
-                    f"('{code}') any time to see the roster.")
+                    f"team {code} ({len(ordered)} members; coordinator: "
+                    f"{coordinator_box}). KEEP POLLING your box; setup notices "
+                    f"will follow. Use list_team('{code}') for the roster.")
     return {"ok": True, **team_roster(code),
             "directive": ("TEAM CREATED AND YOU ARE THE COORDINATOR (member #1). "
-                          "NOW DO THIS, IN ORDER: 1) ASK THE OWNER (the human) "
-                          "for a team name, then call set_team_name. 2) ASK THE "
-                          "OWNER whether to give each member an alias — read "
-                          "them the roster. For each alias chosen, call "
-                          "set_member_alias. Members without an alias keep the "
-                          "default '<team_name>-<member_no>'. 3) Report the "
-                          "final roster back to the owner.")}
-
-
-def do_pool(pool_code):
-    if not CODE_RE.match(str(pool_code)):
-        return {"error": "bad_pool_code"}
-    rows = db().execute(
-        "SELECT * FROM boxes WHERE status='waiting' AND pool_code=? "
-        "ORDER BY created_ts", (str(pool_code),)).fetchall()
-    return {"pool_code": str(pool_code), "waiting_count": len(rows),
-            "waiting": [{"box": r["box"], "session_name": r["session_name"],
-                         "platform": r["platform"] or "unknown",
-                         "environment": r["env"], "registered": r["created_ts"],
-                         "last_seen": r["last_seen"]} for r in rows]}
+                          "NOW RUN THE SETUP CENTER WITH THE OWNER, IN ORDER: "
+                          "1) ask for a team name -> set_team_name. "
+                          "2) read the roster to the owner, ask per-member "
+                          "aliases (skipping keeps '<team_name>-<no>') -> "
+                          "set_member_alias. "
+                          "3) ask which member is MANAGER (usually one) and "
+                          "which are WORKERS, or none -> set_box_role. "
+                          "4) ask whether to attach the owner mailbox -> "
+                          "attach_owner_to_team (set it up first if missing). "
+                          "5) report the final team card back to the owner. "
+                          "Setup can be revisited any time; every change "
+                          "broadcasts to the team.")}
 
 
 def do_join_team(code, box):
@@ -388,8 +689,8 @@ def do_join_team(code, box):
     db().execute("UPDATE boxes SET status='teamed', team_code=?, member_no=? "
                  "WHERE box=?", (code, nxt, box))
     db().commit()
-    system_mail(t["coordinator"],
-                f"TEAM UPDATE: box '{box}' joined team {code} as member #{nxt}.")
+    broadcast_team(code, f"TEAM UPDATE: box '{box}' joined as member #{nxt}.\n\n"
+                         + team_card(code))
     return {"ok": True, "member_no": nxt, **team_roster(code)}
 
 
@@ -399,11 +700,9 @@ def do_set_team_name(code, name):
         return {"error": "no_such_team"}
     db().execute("UPDATE teams SET name=? WHERE code=?", (str(name)[:100], code))
     db().commit()
-    for m in team_roster(code)["members"]:
-        system_mail(m["box"],
-                    f"TEAM NAME SET: your team {code} is now named '{name}'. "
-                    f"Your display name is '{m['display_name']}' "
-                    "(default <team_name>-<member_no> unless an alias was assigned).")
+    broadcast_team(code, f"SETUP CHANGE: team {code} is now named '{name}'. "
+                         "Unaliased members display as '<name>-<no>'.\n\n"
+                         + team_card(code))
     return {"ok": True, **team_roster(code)}
 
 
@@ -415,8 +714,50 @@ def do_set_member_alias(code, member_no, alias):
         return {"error": "no_such_member"}
     db().execute("UPDATE boxes SET alias=? WHERE box=?", (str(alias)[:200], r["box"]))
     db().commit()
-    system_mail(r["box"], f"NAME ASSIGNED: the owner named you '{alias}'. "
-                          "This is now your display name on every message you send.")
+    broadcast_team(code, f"SETUP CHANGE: member #{member_no} ({r['box']}) is "
+                         f"now named '{alias}'.\n\n" + team_card(code))
+    return {"ok": True, **team_roster(code)}
+
+
+def do_set_box_role(code, member_no, role):
+    code = str(code)
+    if role not in ROLES:
+        return {"error": "bad_role", "detail": f"one of {ROLES}"}
+    r = db().execute("SELECT * FROM boxes WHERE team_code=? AND member_no=?",
+                     (code, int(member_no))).fetchone()
+    if not r:
+        return {"error": "no_such_member"}
+    db().execute("UPDATE boxes SET role=? WHERE box=?", (role, r["box"]))
+    db().commit()
+    extra = ("HARD RULE now active for this member: workers never contact the "
+             "owner; they report to the manager." if role == "worker" else
+             "This member now handles owner contact for the team.")
+    broadcast_team(code, f"SETUP CHANGE: member #{member_no} ({r['box']}) role "
+                         f"= {role.upper()}. {extra}\n\n" + team_card(code))
+    return {"ok": True, **team_roster(code)}
+
+
+def do_attach_owner(code):
+    code = str(code)
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
+        return {"error": "no_such_team"}
+    o = owner_row()
+    if not (o and o["confirmed"]):
+        return {"error": "owner_not_configured",
+                "detail": "set up and confirm the owner mailbox first "
+                          "(setup_owner_mailbox -> owner confirms -> "
+                          "confirm_owner_mailbox)"}
+    db().execute("UPDATE boxes SET team_code=?, member_no=0, status='teamed' "
+                 "WHERE box=?", (code, OWNER_BOX))
+    db().commit()
+    mode = o["mode"]
+    rules = o["custom_rules"] or OWNER_MODES[mode]["rules"]
+    broadcast_team(code,
+                   f"OWNER ATTACHED to team {code}: {o['alias']} "
+                   f"({o['full_name']}) — owner + human, reachable as box "
+                   f"'owner' (delivered by real email; a sent email counts as "
+                   f"read). OWNER CONTACT RULES (mode {mode}, HARD):\n{rules}"
+                   f"\n\n{team_card(code)}")
     return {"ok": True, **team_roster(code)}
 
 
@@ -429,7 +770,8 @@ def do_boxes():
             (b["box"],)).fetchone()["n"]
         result[b["box"]] = {
             "display_name": display_name(b) or None,
-            "platform": b["platform"] or "unknown",
+            "platform": ("human" if b["is_human"] else (b["platform"] or "unknown")),
+            "role": b["role"] or None,
             "status": b["status"], "team": b["team_code"],
             "member_no": b["member_no"], "pending": pending,
             "last_seen": b["last_seen"],
@@ -440,13 +782,15 @@ def do_boxes():
 def do_history(box, limit=50):
     conn = db()
     rows = conn.execute(
-        "SELECT m.*, d.delivered_as, d.taken_ts FROM deliveries d "
+        "SELECT m.*, d.delivered_as, d.taken_ts, d.email_status FROM deliveries d "
         "JOIN messages m ON m.id=d.msg_id WHERE d.recipient=? "
         "ORDER BY m.id DESC LIMIT ?", (box, min(max(limit, 1), 500))).fetchall()
     out = []
     for r in rows:
         e = envelope(r)
         e["taken_ts"] = r["taken_ts"]
+        if r["email_status"]:
+            e["email_status"] = r["email_status"]
         out.append(e)
     sent = conn.execute(
         "SELECT * FROM messages WHERE sender=? ORDER BY id DESC LIMIT ?",
@@ -459,33 +803,36 @@ def do_history(box, limit=50):
 
 USAGE = {
     "service": "cloud-bridge-relay",
-    "v": 4,
-    "detail": ("Team-aware mailbox relay for agent sessions. MCP server at /mcp "
-               "(Streamable HTTP; tools are self-describing) plus the REST "
-               "mirror below. Lifecycle: register_box (declares platform "
-               "claude-code|codex + runtime environment, enters waiting pool) "
-               "-> owner gives ONE session a 4-digit code -> create_team "
-               "scoops the waiting pool into numbered members -> coordinator "
-               "asks the owner for team name (set_team_name) and optional "
-               "aliases (set_member_alias); unset aliases display as "
-               "<team_name>-<member_no> -> list_team for a one-call roster. "
-               "Every delivery carries an explicit `directive` (ACTION / "
-               "THIS IS A CC / SYSTEM NOTICE) and the sender's platform stamp."),
-    "mcp": {"endpoint": "/mcp", "transport": "streamable-http"},
+    "v": 5,
+    "detail": ("Team relay for agent sessions: pools -> teams -> setup center "
+               "(names, aliases, manager/worker roles, owner mailbox with real "
+               "email forwarding). MCP at /mcp (tools + guided prompts; in "
+               "Claude Code the prompts appear as slash commands "
+               "/mcp__cloud-bridge-relay__onboard etc). Hard rules: workers "
+               "never contact the owner; owner contact is mode-gated. Every "
+               "delivery carries directive + platform/role stamps + a team "
+               "card footer."),
+    "mcp": {"endpoint": "/mcp", "transport": "streamable-http",
+            "prompts": ["onboard", "setup", "add-owner-mailbox", "team-status"]},
     "endpoints": {
         "GET /": "this document",
-        "POST /register": "{box, session_name?, platform, environment, pool_code}",
-        "GET /pool?code=X": "who is waiting in pool X",
-        "POST /team/create": "{pool_code, coordinator_box} — initialize team from pool",
+        "POST /register": "{box, platform, environment, pool_code, session_name?, role?}",
+        "GET /pool?code=X": "who waits in pool X",
+        "POST /team/create": "{pool_code, coordinator_box}",
         "POST /team/join": "{code, box}",
         "POST /team/name": "{code, name}",
         "POST /team/alias": "{code, member_no, alias}",
-        "GET /team?code=X": "roster",
-        "POST /send": "{from, to, cc?, body}",
+        "POST /team/role": "{code, member_no, role}",
+        "POST /team/attach-owner": "{code}",
+        "GET /team?code=X": "roster + team card",
+        "POST /owner/setup": "{full_name, alias?, email}",
+        "POST /owner/confirm": "{override?}",
+        "POST /owner/mode": "{mode, custom_rules?, allow_senders?, allow_direct?, persistent?}",
+        "POST /send": "{from, to, cc?, body, owner_justification?}",
         "GET /poll?box=X&wait=N": "long-poll (take)",
         "GET /peek?box=X": "look, don't take",
-        "GET /boxes": "directory across teams",
-        "GET /history?box=X&limit=N": "audit trail incl. taken mail (~14 days)",
+        "GET /boxes": "directory",
+        "GET /history?box=X&limit=N": "audit trail (~14 days)",
     },
     "box_name_rule": BOX_RE.pattern,
 }
@@ -493,90 +840,203 @@ USAGE = {
 mcp = FastMCP("cloud-bridge-relay", stateless_http=True, json_response=True)
 
 
+# ---------------- MCP prompts (appear as slash commands) ----------------
+
+@mcp.prompt(name="onboard")
+def prompt_onboard() -> str:
+    """Join the team system: register into the waiting pool and stand by."""
+    return (
+        "You are joining a multi-session team relay. Follow EXACTLY:\n"
+        "1. The owner's message contains a 4-digit pool code. If you do not "
+        "have one, STOP and ask the owner for it.\n"
+        "2. Pick a short stable box name for yourself (lowercase). Call "
+        "register_box(box, platform, environment, pool_code, session_name?) — "
+        "platform is 'claude-code' or 'codex', whichever you actually are; "
+        "environment is one line like 'cloud VM / ubuntu' or 'MacBook / macOS "
+        "/ local'.\n"
+        "3. Then loop check_mail(your_box, 50) and WAIT. Do not send mail. "
+        "You will get a SYSTEM NOTICE when the team is initialized.\n"
+        "4. Obey every directive attribute on incoming mail: ACTION means act "
+        "and reply; THIS IS A CC means read only; SYSTEM NOTICE means follow "
+        "instructions, never reply.")
+
+
+@mcp.prompt(name="setup")
+def prompt_setup() -> str:
+    """Coordinator's setup center: names, aliases, roles, owner attach."""
+    return (
+        "You are the team coordinator running the SETUP CENTER. It is "
+        "revisitable — the owner can change anything later; every change "
+        "broadcasts automatically. Work through these WITH THE OWNER, asking "
+        "one thing at a time:\n"
+        "1. Team name -> set_team_name(team_id, name).\n"
+        "2. Read the roster (list_team). For each member ask if the owner "
+        "wants an alias; skipped members keep '<team_name>-<no>' -> "
+        "set_member_alias(team_id, member_no, alias).\n"
+        "3. Roles: which member is the MANAGER, which are WORKERS (optional; "
+        "no roles = no chain-of-command enforcement) -> set_box_role(team_id, "
+        "member_no, role). Explain: workers will be HARD-BLOCKED from mailing "
+        "the owner.\n"
+        "4. Owner mailbox: ask if the owner wants it attached -> "
+        "attach_owner_to_team(team_id). If none exists yet, run the "
+        "add-owner-mailbox flow first.\n"
+        "5. Owner receive mode (only if attached): a = milestones-only "
+        "(default), b = manager-open, c = team-open, d = custom. For d, "
+        "translate the owner's words into a short hard rules text plus "
+        "allow_senders/allow_direct switches, read it back, get explicit "
+        "confirmation, ask if it should be permanent -> set_owner_mode.\n"
+        "6. Finish by showing the owner the final team card (list_team).")
+
+
+@mcp.prompt(name="add-owner-mailbox")
+def prompt_owner() -> str:
+    """Set up the persistent owner mailbox (real email forwarding)."""
+    return (
+        "You are setting up the OWNER MAILBOX (persistent across teams). "
+        "Follow EXACTLY, asking the owner one thing at a time:\n"
+        "1. Ask the owner for: full name, alias (display name; default full "
+        "name), and their REAL email address.\n"
+        "2. Call setup_owner_mailbox(full_name, alias, email). This sends a "
+        "verification email.\n"
+        "3. ASK THE OWNER whether it arrived. Only when the owner says yes, "
+        "call confirm_owner_mailbox(). NEVER confirm without the owner's "
+        "word.\n"
+        "4. If the send FAILED you MUST read the exact error to the owner. "
+        "The owner may fix it and retry, or explicitly say 'override' -> "
+        "confirm_owner_mailbox(override=True).\n"
+        "5. Then ask which receive mode the owner wants (a default / b / c / "
+        "d custom) and call set_owner_mode — for d, follow its directive.\n"
+        "After confirmation the owner is reachable as box 'owner'; delivered "
+        "mail is forwarded as real email and a successful send counts as "
+        "read.")
+
+
+@mcp.prompt(name="team-status")
+def prompt_status() -> str:
+    """Show the human a formatted team overview."""
+    return ("Call list_team(team_id) (find the id via list_boxes if unknown) "
+            "and present the team_card plus pending-mail counts to the human "
+            "verbatim, nicely formatted. Then stop.")
+
+
+# ---------------- MCP tools ----------------
+
 @mcp.tool()
 async def register_box(box: str, platform: str, environment: str,
-                       pool_code: str, session_name: str = "") -> dict:
-    """Register your mailbox and enter a team waiting pool.
+                       pool_code: str, session_name: str = "",
+                       role: str = "") -> dict:
+    """Register your mailbox into a waiting pool.
 
-    box: your stable box name (lowercase, digits, - _; you keep it forever).
-    platform: MANDATORY, exactly "claude-code" or "codex" — teammates must
-    know what they are talking to; it is stamped on every message you send.
-    environment: one line about where you run (host/OS/model), e.g.
-    "MacBook M1 Pro / macOS / local".
-    pool_code: the 4-digit code the owner gave you when they pointed you at
-    this MCP — same code = same pool. No code, no pool.
-    session_name: your session's current display title, if you know it.
-    After registering: poll check_mail and WAIT for the initialization notice.
+    box: stable lowercase name (yours forever; 'owner' is reserved).
+    platform: MANDATORY 'claude-code' or 'codex' — stamped on every message.
+    environment: one line, e.g. 'cloud session / ubuntu' or 'MacBook / macOS'.
+    pool_code: the 4-digit code the owner gave you. No code, no pool.
+    role: optional 'manager' or 'worker' (can also be set later in setup).
+    Then poll check_mail and WAIT for the initialization notice.
     """
-    return do_register(box, session_name, platform, environment, pool_code)
+    return do_register(box, session_name, platform, environment, pool_code, role)
 
 
 @mcp.tool()
 async def watch_pool(pool_code: str) -> dict:
-    """See who is currently waiting in a pool (box, session_name, platform,
-    environment, registered time). If the owner told you to monitor the pool,
-    call this periodically and report; when the owner says 'initialize',
-    call initialize_team."""
+    """See who is waiting in a pool. If told to monitor, call periodically and
+    report; when the owner says 'initialize', call initialize_team."""
     return do_pool(pool_code)
 
 
 @mcp.tool()
 async def initialize_team(pool_code: str, coordinator_box: str) -> dict:
-    """Convert everyone waiting in this pool into a team. Call this ONLY when
-    the owner (the human) says 'initialize'. You become member #1 and the
-    coordinator. A unique random team id (tm-xxxxxx) is generated — pool
-    codes may repeat, team ids never do. The response directive tells you
-    exactly what to ask the owner next (team name, optional aliases)."""
+    """Turn the whole waiting pool into a team. Call ONLY on the owner's word
+    'initialize'. You become coordinator (#1); a unique team id (tm-xxxxxx)
+    is generated. The response directive walks you through the setup center."""
     return do_initialize_team(pool_code, coordinator_box)
 
 
 @mcp.tool()
 async def join_team(code: str, box: str) -> dict:
-    """Join an existing team late (you must have registered first)."""
+    """Join an existing team late (register_box first). Broadcasts the update."""
     return do_join_team(code, box)
 
 
 @mcp.tool()
 async def set_team_name(code: str, name: str) -> dict:
-    """Coordinator only: set the team's name (ask the owner for it first).
-    Members without an explicit alias will display as '<name>-<member_no>'."""
+    """Setup center: set the team name the owner chose. Broadcasts."""
     return do_set_team_name(code, name)
 
 
 @mcp.tool()
 async def set_member_alias(code: str, member_no: int, alias: str) -> dict:
-    """Coordinator only: assign the alias the owner chose for one member.
-    Skipping a member keeps their default '<team_name>-<member_no>'."""
+    """Setup center: set the alias the owner chose for one member. Broadcasts."""
     return do_set_member_alias(code, member_no, alias)
 
 
 @mcp.tool()
+async def set_box_role(code: str, member_no: int, role: str) -> dict:
+    """Setup center: mark a member 'manager' or 'worker' (owner's choice).
+    HARD consequence: workers can never mail the owner. Broadcasts."""
+    return do_set_box_role(code, member_no, role)
+
+
+@mcp.tool()
+async def setup_owner_mailbox(full_name: str, email: str, alias: str = "") -> dict:
+    """Owner mailbox step 1: store name/alias/email and send a verification
+    email. Follow the returned directive — the OWNER must confirm receipt
+    before confirm_owner_mailbox; a failed send MUST be reported to the owner."""
+    return do_setup_owner(full_name, alias, email)
+
+
+@mcp.tool()
+async def confirm_owner_mailbox(override: bool = False) -> dict:
+    """Owner mailbox step 2: call ONLY after the owner says the verification
+    email arrived (or explicitly says 'override' after a reported failure)."""
+    return do_confirm_owner(override)
+
+
+@mcp.tool()
+async def set_owner_mode(mode: str, custom_rules: str = "",
+                         allow_senders: str = "", allow_direct: str = "",
+                         persistent: bool | None = None) -> dict:
+    """Owner receive mode: a=milestones-only(default) b=manager-open
+    c=team-open d=custom. For d, first translate the owner's wishes into a
+    short hard rules text + allow_senders(manager_only|any) +
+    allow_direct(justified_only|free), read them back, get the owner's
+    explicit confirmation, and ask whether to keep it permanently."""
+    return do_set_owner_mode(mode, custom_rules, allow_senders, allow_direct,
+                             persistent)
+
+
+@mcp.tool()
+async def attach_owner_to_team(code: str) -> dict:
+    """Setup center: attach the confirmed owner mailbox to a team as member #0
+    (owner + human). Broadcasts the owner contact rules to everyone."""
+    return do_attach_owner(code)
+
+
+@mcp.tool()
 async def list_team(code: str) -> dict:
-    """One-call roster: number, box, display name, platform, environment,
-    last_seen and pending-mail count for every member. `code` is the team id
-    (tm-xxxxxx) from the initialization notice."""
+    """One-call roster + formatted team card for a team id (tm-xxxxxx)."""
     return team_roster(str(code))
 
 
 @mcp.tool()
 async def send_mail(sender_box: str, to: list[str], body: str,
-                    cc: list[str] | None = None) -> dict:
-    """Send a message. `to` = must act; `cc` = FYI copy only.
-
-    Your display name and platform are stamped automatically from your
-    registration — register_box first. Recipients see an explicit directive
-    line distinguishing ACTION mail from CC copies.
-    """
-    res, err = do_send(sender_box, to, cc or [], body)
+                    cc: list[str] | None = None,
+                    owner_justification: str = "") -> dict:
+    """Send a message. to = must act; cc = FYI copy. Identity/platform/role
+    stamps come from your registration. Mailing box 'owner' is HARD-GATED by
+    the owner mode: workers are always refused; a direct `to` may require
+    owner_justification (one sentence: why the owner must see this NOW)."""
+    res, err = do_send(sender_box, to, cc or [], body,
+                       owner_justification=owner_justification)
     return res if res else err
 
 
 @mcp.tool()
 async def check_mail(box: str, wait_seconds: int = 25) -> list[dict]:
-    """Long-poll your mailbox: returns pending messages and marks them taken
-    (they stay visible in mail_history ~14 days). Each message carries kind
-    (mail|system), from.{box,display_name,member_no,team,platform},
-    delivered_as (to|cc) and a directive line saying whether YOU must act."""
+    """Long-poll your mailbox; returns messages and marks them taken (still
+    visible in mail_history ~14 days). Each message: kind (mail|system),
+    from{box,display_name,member_no,team,platform,role,is_human},
+    delivered_as (to|cc), directive (OBEY IT), team_info footer."""
     if not BOX_RE.match(box):
         return [{"error": "bad_box"}]
     return await do_poll(box, wait_seconds)
@@ -592,19 +1052,21 @@ async def peek_mail(box: str) -> list[dict]:
 
 @mcp.tool()
 async def list_boxes() -> dict:
-    """Directory of all known boxes across teams: display name, platform,
-    status, team/member number, pending count, last_seen."""
+    """Directory of all boxes: display name, platform/human, role, team,
+    pending count, last_seen."""
     return do_boxes()
 
 
 @mcp.tool()
 async def mail_history(box: str, limit: int = 50) -> dict:
-    """Audit trail: received (taken_ts null = still pending) and sent
-    messages for a box. Taken mail stays ~14 days for cross-checking."""
+    """Audit trail: received (taken_ts null = pending; email_status for
+    owner-bound mail) and sent messages. Kept ~14 days."""
     if not BOX_RE.match(box):
         return {"error": "bad_box"}
     return do_history(box, limit)
 
+
+# ---------------- REST mirror ----------------
 
 def _json_route(handler):
     async def route(req: Request):
@@ -631,7 +1093,7 @@ async def _r_health(_req, _p):
 async def _r_register(_req, p):
     return do_register(p.get("box", ""), p.get("session_name", ""),
                        p.get("platform", ""), p.get("environment", ""),
-                       p.get("pool_code", ""))
+                       p.get("pool_code", ""), p.get("role", ""))
 
 
 async def _r_team_create(_req, p):
@@ -655,6 +1117,33 @@ async def _r_team_alias(_req, p):
         return {"error": "bad_member_no"}
 
 
+async def _r_team_role(_req, p):
+    try:
+        return do_set_box_role(p.get("code", ""), int(p.get("member_no", 0)),
+                               p.get("role", ""))
+    except (TypeError, ValueError):
+        return {"error": "bad_member_no"}
+
+
+async def _r_attach_owner(_req, p):
+    return do_attach_owner(p.get("code", ""))
+
+
+async def _r_owner_setup(_req, p):
+    return await asyncio.to_thread(do_setup_owner, p.get("full_name", ""),
+                                   p.get("alias", ""), p.get("email", ""))
+
+
+async def _r_owner_confirm(_req, p):
+    return do_confirm_owner(bool(p.get("override")))
+
+
+async def _r_owner_mode(_req, p):
+    return do_set_owner_mode(p.get("mode", ""), p.get("custom_rules", ""),
+                             p.get("allow_senders", ""), p.get("allow_direct", ""),
+                             p.get("persistent"))
+
+
 async def _r_team(req, _p):
     return team_roster(req.query_params.get("code", ""))
 
@@ -665,7 +1154,8 @@ async def _r_pool(req, _p):
 
 async def _r_send(_req, p):
     res, err = do_send(p.get("from", ""), p.get("to"), p.get("cc"),
-                       p.get("body", ""), fallback_alias=p.get("alias", ""))
+                       p.get("body", ""), fallback_alias=p.get("alias", ""),
+                       owner_justification=p.get("owner_justification", ""))
     return res if res else err
 
 
@@ -712,6 +1202,11 @@ app.router.routes.extend([
     Route("/team/join", _json_route(_r_team_join), methods=["POST"]),
     Route("/team/name", _json_route(_r_team_name), methods=["POST"]),
     Route("/team/alias", _json_route(_r_team_alias), methods=["POST"]),
+    Route("/team/role", _json_route(_r_team_role), methods=["POST"]),
+    Route("/team/attach-owner", _json_route(_r_attach_owner), methods=["POST"]),
+    Route("/owner/setup", _json_route(_r_owner_setup), methods=["POST"]),
+    Route("/owner/confirm", _json_route(_r_owner_confirm), methods=["POST"]),
+    Route("/owner/mode", _json_route(_r_owner_mode), methods=["POST"]),
     Route("/team", _json_route(_r_team)),
     Route("/pool", _json_route(_r_pool)),
     Route("/send", _json_route(_r_send), methods=["POST"]),
