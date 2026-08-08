@@ -1,0 +1,41 @@
+# crew-relay configuration. Copy to crew.toml and edit. Env vars override.
+# ── deployment profile ──────────────────────────────────────────────────
+# local   : 127.0.0.1 only, no auth — sessions on THIS machine only
+# private : reachable (tunnel/LAN), OAuth or preset tokens, deployer-gated
+# cloud   : public, open OAuth registration (+ GitHub login on the web UI)
+mode = "local"
+port = 8790
+# public_url is REQUIRED for private/cloud (OAuth callbacks need a stable https base)
+# public_url = "https://crew.example.com"
+# data_dir = "/var/lib/crew"
+
+[brand]
+name = "crew"
+accent = "#1c4f8f"        # placeholder; recolor to taste (main surface is white)
+# board_url = "https://board.example.com"
+
+[email]                    # owner-mailbox delivery; optional
+provider = "none"          # "resend" to enable
+# from = "crew@verification.example.com"
+# api_key_env = "RESEND_API_KEY"
+
+[limits]
+rate_n = 30
+rate_window_s = 300
+prune_days = 14
+
+[timers]
+stale_after_s = 600
+quiet_after_s = 21600
+task_stall_after_s = 7200
+watcher_gap_s = 180
+
+[team]
+pool_code_digits = 4
+default_owner_mode = "a"
+board_refresh_s = 10
+
+[auth]
+open_registration = false  # cloud: allow anyone to register a web account
+# static_tokens_env = "CREW_STATIC_TOKENS"   # private: preset bearer tokens
+# session_secret_env = "CREW_SESSION_SECRET"
