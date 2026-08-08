@@ -264,19 +264,55 @@ def broadcast_team(code, body):
 
 # ---------------- email (Resend) ----------------
 
-def resend_email(to_addr, subject, text):
+FROM_ADDR = "crew@verification.gaelisus.com"
+
+
+def email_html(badge, badge_color, body, meta_rows, card):
+    """Minimal clean HTML mail: badge, body, meta table, team card."""
+    import html as h
+    rows = "".join(
+        f"<tr><td style='padding:2px 12px 2px 0;color:#8a8f98;white-space:nowrap'>"
+        f"{h.escape(k)}</td><td style='padding:2px 0;color:#3c4149'>"
+        f"{h.escape(v)}</td></tr>" for k, v in meta_rows if v)
+    card_html = ""
+    if card:
+        lines = "".join(f"<div style='padding:1px 0'>{h.escape(l)}</div>"
+                        for l in card.splitlines())
+        card_html = (f"<div style='margin-top:16px;padding:10px 14px;"
+                     f"background:#f6f7f8;border-radius:8px;font-size:12px;"
+                     f"color:#5e646e;font-family:ui-monospace,Menlo,monospace'>"
+                     f"{lines}</div>")
+    body_html = "".join(f"<p style='margin:0 0 10px'>{h.escape(p)}</p>"
+                        for p in body.split("\n\n"))
+    return f"""<div style="max-width:560px;margin:0 auto;padding:24px;
+font-family:-apple-system,'Segoe UI',Roboto,sans-serif;color:#1c1e21">
+<div style="margin-bottom:14px">
+  <span style="display:inline-block;padding:3px 10px;border-radius:99px;
+  background:{badge_color};color:#fff;font-size:11px;font-weight:600;
+  letter-spacing:.4px">{h.escape(badge)}</span>
+  <span style="margin-left:8px;color:#8a8f98;font-size:12px">crew</span>
+</div>
+<div style="font-size:14px;line-height:1.55">{body_html}</div>
+<table style="margin-top:14px;font-size:12px;border-collapse:collapse">{rows}</table>
+{card_html}
+</div>"""
+
+
+def resend_email(to_addr, subject, text, html=None, sender_label="crew"):
     key = os.environ.get("RESEND_API_KEY", "")
-    frm = os.environ.get("RESEND_FROM", "onboarding@resend.dev")
     if not key:
         return {"error": ("RESEND_API_KEY is not configured on the droplet. "
                           "The owner must: 1) add `RESEND_API_KEY` under "
                           "`secrets:` in the site manifest (needs a deploy "
                           "code), 2) run `hostd secret set cloud-bridge-relay "
                           "RESEND_API_KEY` on the droplet.")}
+    payload = {"from": f"{sender_label} <{FROM_ADDR}>", "to": [to_addr],
+               "subject": subject, "text": text}
+    if html:
+        payload["html"] = html
     req = urllib.request.Request(
         "https://api.resend.com/emails",
-        data=json.dumps({"from": f"Team Relay <{frm}>", "to": [to_addr],
-                         "subject": subject, "text": text}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json",
                  "User-Agent": "cloud-bridge-relay/5"})
@@ -300,21 +336,28 @@ def _email_owner_delivery(mid):
     if not (o and o["confirmed"] and row):
         return
     stamp = sender_stamp(row["sender"], row["alias"])
-    kind_line = ("CC — for your information"
-                 if row["delivered_as"] == "cc" else "ACTION — addressed to you")
+    is_cc = row["delivered_as"] == "cc"
     footer = team_card(stamp["team"]) if stamp["team"] else ""
-    text = (f"{row['body']}\n\n"
-            f"—\n{kind_line}\n"
-            f"from: {stamp['display_name']} (box {stamp['box']}, "
-            f"{stamp['role'] or 'no-role'}, {stamp['platform']})\n"
-            f"to: {', '.join(json.loads(row['to_json']))}"
-            + (f" · cc: {', '.join(json.loads(row['cc_json']))}"
-               if json.loads(row["cc_json"]) else "")
+    tname = ""
+    if stamp["team"]:
+        t = db().execute("SELECT name FROM teams WHERE code=?",
+                         (stamp["team"],)).fetchone()
+        tname = (t["name"] if t and t["name"] else stamp["team"])
+    sender_label = f"crew-{tname}" if tname else "crew"
+    meta = [("from", f"{stamp['display_name']} · box {stamp['box']} · "
+                     f"{stamp['role'] or 'no-role'} · {stamp['platform']}"),
+            ("to", ", ".join(json.loads(row["to_json"]))),
+            ("cc", ", ".join(json.loads(row["cc_json"])))]
+    kind_line = "CC — for your information" if is_cc else "ACTION — addressed to you"
+    text = (f"{row['body']}\n\n—\n{kind_line}\n"
+            + "\n".join(f"{k}: {v}" for k, v in meta if v)
             + (f"\n\n{footer}" if footer else ""))
-    subject = (f"[{'CC' if row['delivered_as'] == 'cc' else 'ACTION'}] "
-               f"from {stamp['display_name']}"
-               + (f" · team {stamp['team']}" if stamp["team"] else ""))
-    res = resend_email(o["email"], subject, text)
+    html = email_html("CC · FYI" if is_cc else "ACTION",
+                      "#8a8f98" if is_cc else "#d4380d",
+                      row["body"], meta, footer)
+    subject = (f"[{'CC' if is_cc else 'ACTION'}] {stamp['display_name']}"
+               + (f" · {tname}" if tname else ""))
+    res = resend_email(o["email"], subject, text, html, sender_label)
     if res.get("ok"):
         conn.execute("UPDATE deliveries SET taken_ts=?, email_status='sent' "
                      "WHERE msg_id=? AND recipient=?", (now(), mid, OWNER_BOX))
@@ -339,17 +382,37 @@ def do_setup_owner(full_name, alias, email):
     if not full_name or not email or "@" not in email:
         return {"error": "bad_input", "detail": "need full_name and a real email"}
     conn = db()
+    prev = owner_row()
+    full_name = str(full_name)[:100]
+    alias = str(alias or full_name)[:100]
+    email = str(email)[:200]
+    if prev and prev["confirmed"] and prev["email"] == email:
+        # Editing name/alias only: same verified address, no re-verification.
+        conn.execute("UPDATE owner_mailbox SET full_name=?, alias=? WHERE id=1",
+                     (full_name, alias))
+        conn.execute("UPDATE boxes SET alias=?, session_name=? WHERE box=?",
+                     (alias, full_name, OWNER_BOX))
+        conn.commit()
+        b = box_row(OWNER_BOX)
+        if b and b["team_code"]:
+            broadcast_team(b["team_code"],
+                           f"SETUP CHANGE: owner is now '{alias}' "
+                           f"({full_name}).\n\n" + team_card(b["team_code"]))
+        return {"ok": True, "updated": "name/alias only",
+                "detail": "email unchanged, verification kept"}
     conn.execute("INSERT INTO owner_mailbox(id,full_name,alias,email,created_ts) "
                  "VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                  "full_name=excluded.full_name, alias=excluded.alias, "
                  "email=excluded.email, confirmed=0, last_send_error=''",
-                 (str(full_name)[:100], str(alias or full_name)[:100],
-                  str(email)[:200], now()))
+                 (full_name, alias, email, now()))
     conn.commit()
-    res = resend_email(email, "Owner mailbox verification — team relay",
-                       f"Hello {full_name},\n\nthis is the verification mail "
-                       "for your owner mailbox on the team relay. If you can "
-                       "read this, tell your session to confirm.\n\n— relay")
+    body = (f"Hello {full_name},\n\nthis is the verification mail for your "
+            "owner mailbox on crew. If you can read this, tell your session "
+            "to confirm.")
+    res = resend_email(email, "Verify your owner mailbox · crew", body,
+                       email_html("VERIFY", "#1668dc", body,
+                                  [("mailbox", "owner"), ("email", email)], ""),
+                       "crew-setup")
     if res.get("ok"):
         return {"ok": True, "verification": "sent",
                 "directive": ("VERIFICATION EMAIL SENT to " + email + ". NOW "
@@ -803,8 +866,8 @@ def do_history(box, limit=50):
 
 
 USAGE = {
-    "service": "cloud-bridge-relay",
-    "v": 5,
+    "service": "crew",
+    "v": 5.1,
     "detail": ("Team relay for agent sessions: pools -> teams -> setup center "
                "(names, aliases, manager/worker roles, owner mailbox with real "
                "email forwarding). MCP at /mcp (tools + guided prompts; in "
@@ -838,7 +901,7 @@ USAGE = {
     "box_name_rule": BOX_RE.pattern,
 }
 
-mcp = FastMCP("cloud-bridge-relay", stateless_http=True, json_response=True)
+mcp = FastMCP("crew", stateless_http=True, json_response=True)
 
 
 # ---------------- MCP prompts (appear as slash commands) ----------------
@@ -980,10 +1043,11 @@ async def set_box_role(code: str, member_no: int, role: str) -> dict:
 
 @mcp.tool()
 async def setup_owner_mailbox(full_name: str, email: str, alias: str = "") -> dict:
-    """Owner mailbox step 1: store name/alias/email and send a verification
-    email. Follow the returned directive — the OWNER must confirm receipt
-    before confirm_owner_mailbox; a failed send MUST be reported to the owner."""
-    return do_setup_owner(full_name, alias, email)
+    """Create OR edit the owner mailbox. Same verified email = name/alias
+    update only, instant. New/changed email = a verification mail is sent and
+    the OWNER must confirm receipt before confirm_owner_mailbox; a failed
+    send MUST be reported to the owner verbatim."""
+    return await asyncio.to_thread(do_setup_owner, full_name, alias, email)
 
 
 @mcp.tool()
