@@ -55,6 +55,9 @@ DB = DATA_DIR / "relay.db"
 MAX_BODY = 256 * 1024
 MAX_WAIT = 55
 PRUNE_DAYS = 14
+RATE_N = 30           # max sends per box...
+RATE_WINDOW = 300     # ...per this many seconds; hard refusal, never silent
+STALE_AFTER = 600     # teamed agent silent for this long -> flagged, manager told
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 CODE_RE = re.compile(r"^\d{4}$")
 PLATFORMS = ("claude-code", "codex")
@@ -160,6 +163,8 @@ def init_db():
             pass
     for tbl, col, decl in [("messages", "kind", "TEXT NOT NULL DEFAULT 'mail'"),
                            ("messages", "client_key", "TEXT"),
+                           ("messages", "reply_to", "INTEGER"),
+                           ("boxes", "stale", "INTEGER NOT NULL DEFAULT 0"),
                            ("teams", "rv", "INTEGER NOT NULL DEFAULT 1"),
                            ("boxes", "seen_rv", "INTEGER NOT NULL DEFAULT 0"),
                            ("deliveries", "email_status", "TEXT"),
@@ -245,8 +250,9 @@ def team_card(code) -> str:
         role = r["role"] or ("owner" if r["box"] == OWNER_BOX else "-")
         env = (r["env"] or "").strip()
         tail = f" · {env}" if env and not r["is_human"] else ""
+        mark = " · STALE" if r["stale"] else ""
         lines.append(f"#{r['member_no'] or 0} {who} · box:{r['box']} · "
-                     f"{role} · {kind}{tail}")
+                     f"{role} · {kind}{tail}{mark}")
     return "\n".join(lines)
 
 
@@ -550,8 +556,31 @@ def owner_gate(sender, to, cc, justification):
 
 # ---------------- core send/receive ----------------
 
+def rate_check(sender):
+    """Sliding-window send limit. Refuses LOUDLY — the sender always learns
+    the message was NOT sent and when to retry."""
+    rows = db().execute(
+        "SELECT ts FROM messages WHERE sender=? ORDER BY id DESC LIMIT ?",
+        (sender, RATE_N)).fetchall()
+    if len(rows) < RATE_N:
+        return None
+    oldest = datetime.fromisoformat(rows[-1]["ts"])
+    age = (datetime.now(timezone.utc) - oldest).total_seconds()
+    if age >= RATE_WINDOW:
+        return None
+    retry = int(RATE_WINDOW - age) + 1
+    return {"error": "rate_limited", "sent": False,
+            "retry_after_s": retry,
+            "directive": (f"YOUR MESSAGE WAS NOT SENT. You have sent {RATE_N} "
+                          f"messages in the last {RATE_WINDOW}s, which is the "
+                          f"limit. Wait {retry}s and send again — do NOT "
+                          "assume delivery, and consider batching several "
+                          "updates into one templated message instead of "
+                          "streaming them.")}
+
+
 def do_send(sender, to, cc, body, fallback_alias="", owner_justification="",
-            dedup_key=""):
+            dedup_key="", reply_to=None):
     if not isinstance(sender, str) or not BOX_RE.match(sender):
         return None, {"error": "bad_from", "detail": BOX_RE.pattern}
     to, cc = as_box_list(to), as_box_list(cc)
@@ -566,6 +595,18 @@ def do_send(sender, to, cc, body, fallback_alias="", owner_justification="",
     gate = owner_gate(sender, to, cc, owner_justification)
     if gate:
         return None, gate
+    limited = rate_check(sender)
+    if limited:
+        return None, limited
+    if reply_to is not None:
+        try:
+            reply_to = int(reply_to)
+        except (TypeError, ValueError):
+            return None, {"error": "bad_reply_to"}
+        if not db().execute("SELECT 1 FROM messages WHERE id=?",
+                            (reply_to,)).fetchone():
+            return None, {"error": "bad_reply_to",
+                          "detail": f"no message #{reply_to} (pruned or never existed)"}
     if dedup_key:
         dup = db().execute("SELECT id FROM messages WHERE sender=? AND client_key=?",
                            (sender, str(dedup_key)[:100])).fetchone()
@@ -576,6 +617,9 @@ def do_send(sender, to, cc, body, fallback_alias="", owner_justification="",
         body = f"[owner-direct justification: {owner_justification}]\n\n{body}"
     stamp = sender_stamp(sender, fallback_alias)
     mid = _insert_message(sender, stamp["display_name"], "mail", to, cc, body)
+    if reply_to is not None:
+        db().execute("UPDATE messages SET reply_to=? WHERE id=?", (reply_to, mid))
+        db().commit()
     if dedup_key:
         db().execute("UPDATE messages SET client_key=? WHERE id=?",
                      (str(dedup_key)[:100], mid))
@@ -618,6 +662,7 @@ def envelope(row, recipient=None):
     kind = row["kind"]
     dkey = "system" if kind == "system" else row["delivered_as"]
     e = {"id": row["id"], "ts": row["ts"], "kind": kind, "from": stamp,
+         "reply_to": row["reply_to"],
          "to": json.loads(row["to_json"]), "cc": json.loads(row["cc_json"]),
          "delivered_as": row["delivered_as"], "directive": DIRECTIVES[dkey],
          "body": row["body"]}
@@ -808,6 +853,7 @@ def team_roster(code, view="full"):
             "platform": r["platform"] or "unknown",
             "environment": r["env"],
             "last_seen": r["last_seen"], "pending_mail": pending[r["box"]],
+            "stale": bool(r["stale"]),
         } for r in rows],
         "team_card": team_card(code),
     }
@@ -965,6 +1011,95 @@ def do_attach_owner(code):
                    f"read). OWNER CONTACT RULES (mode {mode}, HARD):\n{rules}"
                    f"\n\n{team_card(code)}")
     return {"ok": True, **team_roster(code)}
+
+
+
+def do_thread(mid, limit=50):
+    """Whole conversation around one message: ancestors up to the root, then
+    every descendant, chronological. Flat mail stays flat; replies chain."""
+    try:
+        mid = int(mid)
+    except (TypeError, ValueError):
+        return {"error": "bad_id"}
+    root = db().execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+    if not root:
+        return {"error": "no_such_message"}
+    seen_up = 0
+    while root["reply_to"] and seen_up < limit:
+        parent = db().execute("SELECT * FROM messages WHERE id=?",
+                              (root["reply_to"],)).fetchone()
+        if not parent:
+            break
+        root = parent
+        seen_up += 1
+    chain, queue = [], [root["id"]]
+    while queue and len(chain) < limit:
+        nid = queue.pop(0)
+        r = db().execute("SELECT * FROM messages WHERE id=?", (nid,)).fetchone()
+        if r:
+            chain.append(r)
+            queue.extend(x["id"] for x in db().execute(
+                "SELECT id FROM messages WHERE reply_to=? ORDER BY id", (nid,)))
+    out = []
+    for r in sorted(chain, key=lambda x: x["id"]):
+        s = sender_stamp(r["sender"], r["alias"]) if r["sender"] != "relay" else \
+            {"box": "relay", "display_name": "relay", "platform": "relay",
+             "member_no": None, "team": None, "role": "", "is_human": False}
+        out.append({"id": r["id"], "ts": r["ts"], "kind": r["kind"],
+                    "reply_to": r["reply_to"], "from": s,
+                    "to": json.loads(r["to_json"]), "cc": json.loads(r["cc_json"]),
+                    "body": r["body"]})
+    return {"root": out[0]["id"] if out else None, "messages": out}
+
+
+
+def team_manager_box(code):
+    r = db().execute("SELECT box FROM boxes WHERE team_code=? AND role='manager' "
+                     "AND box!=? LIMIT 1", (code, OWNER_BOX)).fetchone()
+    if r:
+        return r["box"]
+    t = db().execute("SELECT coordinator FROM teams WHERE code=?", (code,)).fetchone()
+    return t["coordinator"] if t else None
+
+
+def stale_sweep():
+    """Flag teamed agents that stopped polling; tell the manager. Clears the
+    flag (with a notice) the moment they poll again."""
+    now_dt = datetime.now(timezone.utc)
+    for b in db().execute("SELECT * FROM boxes WHERE team_code IS NOT NULL "
+                          "AND is_human=0").fetchall():
+        ref = b["last_poll"] or b["last_seen"]
+        try:
+            idle = (now_dt - datetime.fromisoformat(ref)).total_seconds()
+        except Exception:
+            continue
+        mgr = team_manager_box(b["team_code"])
+        if idle > STALE_AFTER and not b["stale"]:
+            db().execute("UPDATE boxes SET stale=1 WHERE box=?", (b["box"],))
+            db().commit()
+            if mgr and mgr != b["box"]:
+                system_mail(mgr,
+                            f"MEMBER STALE: {display_name(b)} (box {b['box']}, "
+                            f"#{b['member_no']}) has not polled for "
+                            f"{int(idle // 60)} min. Work assigned to them may "
+                            "be sitting unread. Consider reassigning or "
+                            "flagging it to the owner if it blocks a "
+                            "milestone.")
+        elif idle <= STALE_AFTER and b["stale"]:
+            db().execute("UPDATE boxes SET stale=0 WHERE box=?", (b["box"],))
+            db().commit()
+            if mgr and mgr != b["box"]:
+                system_mail(mgr, f"MEMBER BACK: {display_name(b)} "
+                                 f"(box {b['box']}) is polling again.")
+
+
+def stale_loop():
+    while True:
+        try:
+            stale_sweep()
+        except Exception:
+            pass
+        time.sleep(60)
 
 
 def do_boxes():
@@ -1572,6 +1707,56 @@ class Crew:
                 return
 '''
 
+
+def audit_html(box, limit=200):
+    import html as h
+    hist = do_history(box, limit)
+    b = box_row(box)
+    items = []
+    for m in hist["received"]:
+        items.append((m["id"], m["ts"], "in", m))
+    for m in hist["sent"]:
+        items.append((m["id"], m["ts"], "out", m))
+    items.sort(key=lambda x: x[0], reverse=True)
+    rows = []
+    for mid, ts, direction, m in items[:limit]:
+        if direction == "in":
+            f = m.get("from", {})
+            who = f"{h.escape(str(f.get('display_name')))} ({h.escape(str(f.get('box')))}, {h.escape(str(f.get('platform')))})"
+            badge = ("SYS" if m.get("kind") == "system"
+                     else m.get("delivered_as", "to").upper())
+            color = {"SYS": "#1668dc", "CC": "#8a8f98"}.get(badge, "#d4380d")
+            state = ("read " + h.escape(m["taken_ts"][:16])
+                     if m.get("taken_ts") else "UNREAD")
+            if m.get("email_status"):
+                state += " · email:" + h.escape(m["email_status"][:40])
+        else:
+            who = "→ " + h.escape(", ".join(m.get("to", [])))
+            if m.get("cc"):
+                who += " · cc " + h.escape(", ".join(m["cc"]))
+            badge, color, state = "OUT", "#1a7f4b", ""
+        reply = (f" · re #{m['reply_to']}" if m.get("reply_to") else "")
+        rows.append(
+            f"<div class='m'><div class='h'>"
+            f"<span class='b' style='background:{color}'>{badge}</span>"
+            f"<b>#{mid}</b> {who}"
+            f"<span class='t'>{h.escape(ts[:19])}{reply} {state}</span></div>"
+            f"<pre>{h.escape(m.get('body', ''))}</pre></div>")
+    name = h.escape(display_name(b) if b else box)
+    return f"""<!doctype html><meta charset=utf-8>
+<title>crew audit · {h.escape(box)}</title>
+<style>body{{font:14px/1.5 -apple-system,sans-serif;max-width:780px;margin:24px auto;
+padding:0 16px;color:#1f2428;background:#f7f7f4}}
+.m{{border:1px solid #e3e4de;border-radius:10px;background:#fff;margin:10px 0;padding:10px 14px}}
+.h{{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}}
+.b{{color:#fff;border-radius:99px;padding:1px 8px;font-size:11px;font-weight:700}}
+.t{{margin-left:auto;color:#8a8f98;font-size:12px}}
+pre{{white-space:pre-wrap;margin:8px 0 0;font:12.5px/1.5 ui-monospace,monospace;color:#3c4149}}
+h1{{font-size:20px}}</style>
+<h1>crew audit — {name} <span style='color:#8a8f98;font-weight:400'>({h.escape(box)}, last {min(limit, len(items))} messages)</span></h1>
+{"".join(rows) or "<p>No mail yet.</p>"}"""
+
+
 USAGE = {
     "service": "crew",
     "v": 5.1,
@@ -1645,6 +1830,8 @@ USAGE = {
         "GET /peek?box=X": "look, don't take",
         "GET /boxes": "directory",
         "GET /history?box=X&limit=N": "audit trail (~14 days)",
+        "GET /thread?id=N": "whole conversation chain around one message",
+        "GET /audit?box=X": "human-readable audit page (open in a browser)",
     },
     "box_name_rule": BOX_RE.pattern,
 }
@@ -1929,7 +2116,7 @@ async def send_mail(sender_box: str, to: list[str], template: str = "note",
                     fields: dict | None = None, body: str = "",
                     cc: list[str] | None = None,
                     owner_justification: str = "",
-                    dedup_key: str = "") -> dict:
+                    dedup_key: str = "", reply_to: int | None = None) -> dict:
     """Send a message. to = must act; cc = FYI copy.
 
     STRUCTURE IS REQUIRED, not prose. Pick a template and fill its fields:
@@ -1938,7 +2125,10 @@ async def send_mail(sender_box: str, to: list[str], template: str = "note",
       handoff(task,context,deliverable) · result(task,outcome) ·
       note(free text in body)
     Missing required fields are refused with the list. `body` is optional
-    extra prose appended under the structured part.
+    extra prose appended under the structured part. Replying? Pass reply_to=
+    <the message id> so the exchange stays a thread (mail_thread follows it).
+    Sends are rate-limited (~30 per 5 min per box); a refusal names the wait
+    and means the message was NOT sent — never assume delivery after an error.
 
     Identity/platform/role stamps come from your registration. Mailing box
     'owner' is HARD-GATED by
@@ -1955,7 +2145,7 @@ async def send_mail(sender_box: str, to: list[str], template: str = "note",
         return terr
     res, err = do_send(sender_box, to, cc or [], rendered,
                        owner_justification=owner_justification,
-                       dedup_key=dedup_key)
+                       dedup_key=dedup_key, reply_to=reply_to)
     return res if res else err
 
 
@@ -2022,6 +2212,14 @@ async def list_boxes() -> dict:
     """Directory of all boxes: display name, platform/human, role, team,
     pending count, last_seen."""
     return do_boxes()
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def mail_thread(message_id: int) -> dict:
+    """Follow a conversation: give any message id and get the whole chain —
+    ancestors up to the root and every reply below it, in order. Use when a
+    message has reply_to set and you need the context before acting."""
+    return do_thread(message_id)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -2158,7 +2356,8 @@ async def _r_send(_req, p):
     res, err = do_send(p.get("from", ""), p.get("to"), p.get("cc"),
                        rendered, fallback_alias=p.get("alias", ""),
                        owner_justification=p.get("owner_justification", ""),
-                       dedup_key=p.get("dedup_key", ""))
+                       dedup_key=p.get("dedup_key", ""),
+                       reply_to=p.get("reply_to"))
     return res if res else err
 
 
@@ -2209,6 +2408,22 @@ async def _r_boxes(_req, _p):
     return {"boxes": do_boxes()}
 
 
+async def _r_thread(req, _p):
+    return do_thread(req.query_params.get("id", ""))
+
+
+async def _r_audit(req):
+    from starlette.responses import HTMLResponse
+    box = req.query_params.get("box", "")
+    if not BOX_RE.match(box):
+        return HTMLResponse("<p>bad box</p>", status_code=400)
+    try:
+        limit = int(req.query_params.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    return HTMLResponse(audit_html(box, min(max(limit, 1), 500)))
+
+
 async def _r_history(req, _p):
     box = req.query_params.get("box", "")
     if not BOX_RE.match(box):
@@ -2222,6 +2437,7 @@ async def _r_history(req, _p):
 
 init_db()
 app = mcp.streamable_http_app()
+threading.Thread(target=stale_loop, daemon=True).start()
 app.router.routes.extend([
     Route("/", _json_route(_r_root)),
     Route("/health", _json_route(_r_health)),
@@ -2248,6 +2464,8 @@ app.router.routes.extend([
     Route("/peek", _json_route(_r_peek)),
     Route("/boxes", _json_route(_r_boxes)),
     Route("/history", _json_route(_r_history)),
+    Route("/thread", _json_route(_r_thread)),
+    Route("/audit", _r_audit),
 ])
 
 if __name__ == "__main__":

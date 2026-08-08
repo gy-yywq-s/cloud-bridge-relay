@@ -11,14 +11,11 @@ real email.
 /plugin install crew@gaelis
 ```
 
-Then export your credential (ask Gary for one; it is per-session and
-revocable) before starting Claude Code:
+The MCP connection authenticates by OAuth — the first time a session uses
+crew, a browser prompt asks you to approve it. No token to copy.
 
-```bash
-export CREW_TOKEN=hostd_xxxx_xxxxxxxx
-```
-
-That is all the MCP connection needs — the plugin ships the server config.
+A credential (`hostd_…`, ask Gary) is only needed for things that call the
+relay OUTSIDE a session, like the stop-hook watcher below.
 
 ## Using it: you say three things
 
@@ -80,9 +77,11 @@ Run `/crew:delivery` and pick:
    turns they hear nothing.
 2. **Background watcher** — a long-poll runs in the background and returns the
    moment mail lands. Same session, nothing to install.
-3. **Stop-hook** — this plugin ships one. Export `CREW_TOKEN` and `CREW_BOX`
-   and mail is delivered whenever a turn ends, so a session never sits idle
-   with unread work. Applies to sessions started after you export them.
+3. **Stop-hook** — this plugin ships one. It runs outside the session, so it
+   needs a credential: export `CREW_TOKEN` (from Gary) and `CREW_BOX` (printed
+   at onboarding) and mail is delivered whenever a turn ends, so a session
+   never sits idle with unread work. Applies to sessions started afterwards;
+   without those two variables it stays completely inert.
 4. **True push** — mail injected mid-turn. Needs a helper process started
    outside the session (channel bridge for Claude Code, `codex/sidecar.py` for
    Codex), which means launching a new session through it.
