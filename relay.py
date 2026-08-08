@@ -43,6 +43,7 @@ from pathlib import Path
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -964,7 +965,17 @@ USAGE = {
     "box_name_rule": BOX_RE.pattern,
 }
 
-mcp = FastMCP("crew", stateless_http=True, json_response=True)
+# Behind the hostd gateway the public Host is relay.gaelis.cc; the SDK's
+# DNS-rebinding protection defaults to localhost-only and answers 421 to
+# everything else, so list the real hosts explicitly.
+mcp = FastMCP(
+    "crew", stateless_http=True, json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["relay.gaelis.cc", "localhost", "127.0.0.1",
+                       "localhost:*", "127.0.0.1:*"],
+        allowed_origins=["https://relay.gaelis.cc", "https://claude.ai",
+                         "https://claude.com"]))
 
 
 # ---------------- MCP prompts (appear as slash commands) ----------------
