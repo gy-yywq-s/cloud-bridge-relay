@@ -838,6 +838,8 @@ def team_roster(code, view="full"):
                 f"{'human' if r['is_human'] else (r['platform'] or 'unknown')}"
                 for r in rows],
             "pending_total": sum(pending.values()),
+            "say_to_owner": roster_text(code),
+            "relay_rule": RELAY_RULE,
         }
     return {
         "team_code": code,
@@ -856,7 +858,37 @@ def team_roster(code, view="full"):
             "stale": bool(r["stale"]),
         } for r in rows],
         "team_card": team_card(code),
+        "say_to_owner": roster_text(code),
+        "relay_rule": RELAY_RULE,
     }
+
+
+
+def roster_text(code):
+    """Canonical human-facing roster. Everything that shows the team to the
+    owner uses THIS, so it always looks the same everywhere. Queries the DB
+    directly — team_roster embeds this output, so it must not call back."""
+    t = db().execute("SELECT * FROM teams WHERE code=?", (code,)).fetchone()
+    name = (t["name"] if t and t["name"] else "(unnamed)")
+    lines = [f"team {name} · {code}"]
+    for r in db().execute("SELECT * FROM boxes WHERE team_code=? "
+                          "ORDER BY member_no", (code,)):
+        pending = db().execute(
+            "SELECT count(*) n FROM deliveries WHERE recipient=? AND taken_ts IS NULL",
+            (r["box"],)).fetchone()["n"]
+        kind = "human" if r["is_human"] else (r["platform"] or "unknown")
+        role = r["role"] or ("owner" if r["box"] == OWNER_BOX else "-")
+        bits = [f"#{r['member_no'] or 0} {display_name(r)}", r["box"], role, kind]
+        if r["env"] and not r["is_human"]:
+            bits.append(r["env"])
+        tail = []
+        if pending:
+            tail.append(f"{pending} unread")
+        if r["stale"]:
+            tail.append("STALE — not polling")
+        lines.append("  " + " · ".join(bits) +
+                     (f"   [{', '.join(tail)}]" if tail else ""))
+    return "\n".join(lines)
 
 
 def do_initialize_team(pool_code, coordinator_box):
@@ -1573,10 +1605,10 @@ def wiz_next(code, restart=False):
         }
     wiz_save(code, "", answers, 1)
     roster = team_roster(code, "full")
-    broadcast_team(code, "SETUP COMPLETE for this team.\n\n" + roster["team_card"])
-    return {"done": True, "summary": roster["team_card"],
+    broadcast_team(code, "SETUP COMPLETE for this team.\n\n" + roster_text(code))
+    return {"done": True, "summary": roster_text(code),
             "answers": answers,
-            "say_to_owner": ("Setup complete.\n\n" + roster["team_card"] +
+            "say_to_owner": ("Setup complete. Here is your crew:\n\n" + roster_text(code) +
                              "\n\nEveryone has been notified. Say \"crew "
                              "setup " + code + " restart\" to redo this "
                              "interview, or name a single change any time."),
@@ -2212,6 +2244,17 @@ async def list_boxes() -> dict:
     """Directory of all boxes: display name, platform/human, role, team,
     pending count, last_seen."""
     return do_boxes()
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def show_roster(code: str) -> dict:
+    """Show the human the current team roster. Returns `say_to_owner` — the
+    canonical rendering (numbers, names, boxes, roles, platforms, unread
+    counts, stale flags). Relay it VERBATIM; do not reformat or summarize.
+    Use whenever the human asks who is on the team or what the state is."""
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (str(code),)).fetchone():
+        return {"error": "no_such_team"}
+    return {"say_to_owner": roster_text(str(code)), "relay_rule": RELAY_RULE}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
