@@ -152,12 +152,15 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     for tbl, col, decl in [("messages", "kind", "TEXT NOT NULL DEFAULT 'mail'"),
+                           ("messages", "client_key", "TEXT"),
                            ("deliveries", "email_status", "TEXT"),
                            ("teams", "pool_code", "TEXT NOT NULL DEFAULT ''")]:
         try:
             c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_client_key "
+              "ON messages(sender, client_key) WHERE client_key IS NOT NULL")
     c.commit()
     c.close()
 
@@ -531,7 +534,8 @@ def owner_gate(sender, to, cc, justification):
 
 # ---------------- core send/receive ----------------
 
-def do_send(sender, to, cc, body, fallback_alias="", owner_justification=""):
+def do_send(sender, to, cc, body, fallback_alias="", owner_justification="",
+            dedup_key=""):
     if not isinstance(sender, str) or not BOX_RE.match(sender):
         return None, {"error": "bad_from", "detail": BOX_RE.pattern}
     to, cc = as_box_list(to), as_box_list(cc)
@@ -546,10 +550,20 @@ def do_send(sender, to, cc, body, fallback_alias="", owner_justification=""):
     gate = owner_gate(sender, to, cc, owner_justification)
     if gate:
         return None, gate
+    if dedup_key:
+        dup = db().execute("SELECT id FROM messages WHERE sender=? AND client_key=?",
+                           (sender, str(dedup_key)[:100])).fetchone()
+        if dup:
+            return {"ok": True, "id": dup["id"], "duplicate": True,
+                    "detail": "already sent (dedup_key matched); no new message"}, None
     if owner_justification and OWNER_BOX in to:
         body = f"[owner-direct justification: {owner_justification}]\n\n{body}"
     stamp = sender_stamp(sender, fallback_alias)
     mid = _insert_message(sender, stamp["display_name"], "mail", to, cc, body)
+    if dedup_key:
+        db().execute("UPDATE messages SET client_key=? WHERE id=?",
+                     (str(dedup_key)[:100], mid))
+        db().commit()
     conn = db()
     conn.execute("DELETE FROM messages WHERE ts < datetime('now', ?) AND id IN "
                  "(SELECT msg_id FROM deliveries GROUP BY msg_id "
@@ -610,14 +624,31 @@ def fetch_box(box, take: bool):
     return out
 
 
-async def do_poll(box, wait_s: int):
+async def do_poll(box, wait_s: int, take: bool):
+    """take=True: legacy auto-take. take=False: ack model — messages stay
+    pending until do_ack; replays return the same ids."""
     touch_box(box)
     deadline = time.monotonic() + min(max(wait_s, 0), MAX_WAIT)
     while True:
-        msgs = fetch_box(box, take=True)
+        msgs = fetch_box(box, take=take)
         if msgs or time.monotonic() >= deadline:
             return msgs
         await asyncio.sleep(1.0)
+
+
+def do_ack(box, through_id):
+    """Cursor ack: mark all deliveries for `box` with msg_id <= through_id as
+    processed. Idempotent — re-acking already-acked ids is a no-op."""
+    try:
+        through_id = int(through_id)
+    except (TypeError, ValueError):
+        return {"error": "bad_through_id"}
+    conn = db()
+    cur = conn.execute(
+        "UPDATE deliveries SET taken_ts=? WHERE recipient=? AND taken_ts IS NULL "
+        "AND msg_id<=?", (now(), box, through_id))
+    conn.commit()
+    return {"ok": True, "acked": cur.rowcount, "through_id": through_id}
 
 
 # ---------------- registration / pools / teams ----------------
@@ -893,7 +924,9 @@ USAGE = {
         "POST /owner/confirm": "{override?}",
         "POST /owner/mode": "{mode, custom_rules?, allow_senders?, allow_direct?, persistent?}",
         "POST /send": "{from, to, cc?, body, owner_justification?}",
-        "GET /poll?box=X&wait=N": "long-poll (take)",
+        "GET /poll?box=X&wait=N": "LEGACY long-poll (auto-takes; loss window on lost response)",
+        "GET /checkmail?box=X&wait=N&ack_through=I": "ack-model long-poll: returns unacked; pass your cursor to ack",
+        "POST /ack": "{box, through_id} — idempotent cursor ack",
         "GET /peek?box=X": "look, don't take",
         "GET /boxes": "directory",
         "GET /history?box=X&limit=N": "audit trail (~14 days)",
@@ -1086,25 +1119,52 @@ async def list_team(code: str) -> dict:
 @mcp.tool()
 async def send_mail(sender_box: str, to: list[str], body: str,
                     cc: list[str] | None = None,
-                    owner_justification: str = "") -> dict:
+                    owner_justification: str = "",
+                    dedup_key: str = "") -> dict:
     """Send a message. to = must act; cc = FYI copy. Identity/platform/role
     stamps come from your registration. Mailing box 'owner' is HARD-GATED by
     the owner mode: workers are always refused; a direct `to` may require
-    owner_justification (one sentence: why the owner must see this NOW)."""
+    owner_justification (one sentence: why the owner must see this NOW).
+
+    DELIVERY GUARANTEE: ok:true means the message is durably committed into
+    EVERY recipient's box before you see the response — any failure returns
+    an explicit error instead. If the response gets lost and you retry, pass
+    the same dedup_key (any string unique to this logical message): retries
+    then return the original id with duplicate:true instead of double-sending."""
     res, err = do_send(sender_box, to, cc or [], body,
-                       owner_justification=owner_justification)
+                       owner_justification=owner_justification,
+                       dedup_key=dedup_key)
     return res if res else err
 
 
 @mcp.tool()
-async def check_mail(box: str, wait_seconds: int = 25) -> list[dict]:
-    """Long-poll your mailbox; returns messages and marks them taken (still
-    visible in mail_history ~14 days). Each message: kind (mail|system),
-    from{box,display_name,member_no,team,platform,role,is_human},
-    delivered_as (to|cc), directive (OBEY IT), team_info footer."""
+async def check_mail(box: str, wait_seconds: int = 25,
+                     ack_through: int = 0) -> list[dict]:
+    """Long-poll your mailbox — ACK MODEL, read this once:
+
+    Messages returned here are NOT consumed. After you have PROCESSED a
+    batch, acknowledge it: either call ack_mail(box, through_id=<highest id
+    you processed>), or pass that id as ack_through on your next check_mail.
+    Unacked messages are redelivered on every poll (crash-safe, at-least-once)
+    — dedupe by the stable `id` if you see one twice. Acking is idempotent.
+    Each message: kind (mail|system), from{box,display_name,member_no,team,
+    platform,role,is_human}, delivered_as (to|cc), directive (OBEY IT),
+    team_info footer."""
     if not BOX_RE.match(box):
         return [{"error": "bad_box"}]
-    return await do_poll(box, wait_seconds)
+    if ack_through:
+        do_ack(box, ack_through)
+    return await do_poll(box, wait_seconds, take=False)
+
+
+@mcp.tool()
+async def ack_mail(box: str, through_id: int) -> dict:
+    """Acknowledge processed mail: marks everything with id <= through_id as
+    done for your box. Idempotent; re-acking is a no-op. Acked mail stays in
+    mail_history ~14 days."""
+    if not BOX_RE.match(box):
+        return {"error": "bad_box"}
+    return do_ack(box, through_id)
 
 
 @mcp.tool()
@@ -1220,11 +1280,13 @@ async def _r_pool(req, _p):
 async def _r_send(_req, p):
     res, err = do_send(p.get("from", ""), p.get("to"), p.get("cc"),
                        p.get("body", ""), fallback_alias=p.get("alias", ""),
-                       owner_justification=p.get("owner_justification", ""))
+                       owner_justification=p.get("owner_justification", ""),
+                       dedup_key=p.get("dedup_key", ""))
     return res if res else err
 
 
 async def _r_poll(req, _p):
+    # Legacy: auto-takes on delivery. New clients: use /checkmail + /ack.
     box = req.query_params.get("box", "")
     if not BOX_RE.match(box):
         return {"error": "bad_box"}
@@ -1232,7 +1294,31 @@ async def _r_poll(req, _p):
         wait = int(req.query_params.get("wait", "25"))
     except ValueError:
         wait = 25
-    return {"messages": await do_poll(box, wait)}
+    return {"messages": await do_poll(box, wait, take=True)}
+
+
+async def _r_checkmail(req, _p):
+    box = req.query_params.get("box", "")
+    if not BOX_RE.match(box):
+        return {"error": "bad_box"}
+    try:
+        wait = int(req.query_params.get("wait", "25"))
+    except ValueError:
+        wait = 25
+    try:
+        ack_through = int(req.query_params.get("ack_through", "0"))
+    except ValueError:
+        ack_through = 0
+    if ack_through:
+        do_ack(box, ack_through)
+    return {"messages": await do_poll(box, wait, take=False)}
+
+
+async def _r_ack(_req, p):
+    box = p.get("box", "")
+    if not BOX_RE.match(box):
+        return {"error": "bad_box"}
+    return do_ack(box, p.get("through_id"))
 
 
 async def _r_peek(req, _p):
@@ -1276,6 +1362,8 @@ app.router.routes.extend([
     Route("/pool", _json_route(_r_pool)),
     Route("/send", _json_route(_r_send), methods=["POST"]),
     Route("/poll", _json_route(_r_poll)),
+    Route("/checkmail", _json_route(_r_checkmail)),
+    Route("/ack", _json_route(_r_ack), methods=["POST"]),
     Route("/peek", _json_route(_r_peek)),
     Route("/boxes", _json_route(_r_boxes)),
     Route("/history", _json_route(_r_history)),
