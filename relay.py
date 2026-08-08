@@ -70,6 +70,9 @@ def init_db():
       taken_ts TEXT, PRIMARY KEY (msg_id, recipient));
     CREATE INDEX IF NOT EXISTS idx_deliv_pending
       ON deliveries(recipient) WHERE taken_ts IS NULL;
+    CREATE TABLE IF NOT EXISTS boxes(
+      box TEXT PRIMARY KEY, alias TEXT NOT NULL DEFAULT '',
+      created_ts TEXT NOT NULL, last_seen TEXT NOT NULL);
     """)
     c.commit()
     c.close()
@@ -96,6 +99,16 @@ def envelope(row, drow):
             "alias": row["alias"], "to": json.loads(row["to_json"]),
             "cc": json.loads(row["cc_json"]), "delivered_as": drow["delivered_as"],
             "body": row["body"]}
+
+
+def touch_box(box, alias=None):
+    conn = db()
+    conn.execute(
+        "INSERT INTO boxes(box,alias,created_ts,last_seen) VALUES(?,?,?,?) "
+        "ON CONFLICT(box) DO UPDATE SET last_seen=excluded.last_seen, "
+        "alias=CASE WHEN excluded.alias!='' THEN excluded.alias ELSE boxes.alias END",
+        (box, alias or "", now(), now()))
+    conn.commit()
 
 
 def do_send(sender, alias, to, cc, body):
@@ -125,6 +138,7 @@ def do_send(sender, alias, to, cc, body):
                  "(SELECT msg_id FROM deliveries GROUP BY msg_id "
                  " HAVING count(*) = count(taken_ts))", (f"-{PRUNE_DAYS} days",))
     conn.commit()
+    touch_box(sender, str(alias)[:200])
     return {"ok": True, "id": mid, "delivered_to": to + cc}, None
 
 
@@ -143,6 +157,7 @@ def fetch_box(box, take: bool):
 
 
 async def do_poll(box, wait_s: int):
+    touch_box(box)
     deadline = time.monotonic() + min(max(wait_s, 0), MAX_WAIT)
     while True:
         msgs = fetch_box(box, take=True)
@@ -153,26 +168,37 @@ async def do_poll(box, wait_s: int):
 
 def do_boxes():
     conn = db()
-    rows = conn.execute("""
-      SELECT box, MAX(last_seen) AS last_seen, SUM(pending) AS pending,
-             MAX(CASE WHEN alias!='' THEN last_seen END) IS NOT NULL AS has_alias
-      FROM (
-        SELECT sender AS box, ts AS last_seen, 0 AS pending, alias FROM messages
-        UNION ALL
-        SELECT recipient, NULL, CASE WHEN taken_ts IS NULL THEN 1 ELSE 0 END, ''
-        FROM deliveries
-      ) GROUP BY box ORDER BY box""").fetchall()
     result = {}
-    for r in rows:
-        alias_row = conn.execute(
-            "SELECT alias FROM messages WHERE sender=? ORDER BY id DESC LIMIT 1",
-            (r["box"],)).fetchone()
-        result[r["box"]] = {
-            "pending": int(r["pending"] or 0),
-            "last_alias": alias_row["alias"] if alias_row else None,
-            "last_sent": r["last_seen"],
+    for b in conn.execute("SELECT * FROM boxes ORDER BY box"):
+        pending = conn.execute(
+            "SELECT count(*) AS n FROM deliveries WHERE recipient=? AND taken_ts IS NULL",
+            (b["box"],)).fetchone()["n"]
+        result[b["box"]] = {
+            "session_name": b["alias"] or None,
+            "pending": pending,
+            "registered": b["created_ts"],
+            "last_seen": b["last_seen"],
         }
     return result
+
+
+def do_history(box, limit=50):
+    conn = db()
+    rows = conn.execute(
+        "SELECT m.*, d.delivered_as, d.taken_ts FROM deliveries d "
+        "JOIN messages m ON m.id=d.msg_id WHERE d.recipient=? "
+        "ORDER BY m.id DESC LIMIT ?", (box, min(max(limit, 1), 500))).fetchall()
+    out = []
+    for r in rows:
+        e = envelope(r, r)
+        e["taken_ts"] = r["taken_ts"]  # null = still pending
+        out.append(e)
+    sent = conn.execute(
+        "SELECT * FROM messages WHERE sender=? ORDER BY id DESC LIMIT ?",
+        (box, min(max(limit, 1), 500))).fetchall()
+    sent_out = [{"id": r["id"], "ts": r["ts"], "to": json.loads(r["to_json"]),
+                 "cc": json.loads(r["cc_json"]), "body": r["body"]} for r in sent]
+    return {"received": out, "sent": sent_out}
 
 
 USAGE = {
@@ -195,7 +221,9 @@ USAGE = {
         "POST /send": "JSON {from, alias?, to, cc?, body}; to/cc: box name or list",
         "GET /poll?box=X&wait=N": "long-poll (N<=55), returns+takes messages",
         "GET /peek?box=X": "look without taking",
-        "GET /boxes": "directory: pending count, last_alias, last_sent per box",
+        "GET /boxes": "directory: session_name, pending count, registered/last_seen per box",
+        "POST /register": "JSON {box, session_name}: announce yourself so others see your name before you ever send",
+        "GET /history?box=X&limit=N": "audit trail: past received (with taken_ts) and sent messages — drained mail stays visible here for ~14 days",
     },
     "box_name_rule": BOX_RE.pattern,
 }
@@ -239,8 +267,30 @@ async def peek_mail(box: str) -> list[dict]:
 
 @mcp.tool()
 async def list_boxes() -> dict:
-    """Directory of active boxes: pending count, last seen alias, last send time."""
+    """Directory of known boxes: session_name, pending count, registered/last_seen."""
     return do_boxes()
+
+
+@mcp.tool()
+async def register_box(box: str, session_name: str) -> dict:
+    """Claim your mailbox and announce your session name in the directory.
+
+    Call this once when you come online (and again after a rename) so other
+    sessions can see who you are before you ever send a message.
+    """
+    if not BOX_RE.match(box):
+        return {"error": "bad_box", "detail": BOX_RE.pattern}
+    touch_box(box, str(session_name)[:200])
+    return {"ok": True, "box": box, "session_name": session_name}
+
+
+@mcp.tool()
+async def mail_history(box: str, limit: int = 50) -> dict:
+    """Audit trail for a box: received messages (taken_ts null = still pending)
+    and sent messages. Drained mail stays here ~14 days for cross-checking."""
+    if not BOX_RE.match(box):
+        return {"error": "bad_box"}
+    return do_history(box, limit)
 
 
 async def rest_root(_):
@@ -284,6 +334,28 @@ async def rest_boxes(_):
     return JSONResponse({"boxes": do_boxes()})
 
 
+async def rest_register(req: Request):
+    try:
+        msg = json.loads(await req.body())
+        box = msg.get("box", "")
+        assert BOX_RE.match(box)
+    except Exception:
+        return JSONResponse({"error": "bad_box"}, status_code=400)
+    touch_box(box, str(msg.get("session_name", ""))[:200])
+    return JSONResponse({"ok": True, "box": box})
+
+
+async def rest_history(req: Request):
+    box = req.query_params.get("box", "")
+    if not BOX_RE.match(box):
+        return JSONResponse({"error": "bad_box"}, status_code=400)
+    try:
+        limit = int(req.query_params.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    return JSONResponse(do_history(box, limit))
+
+
 init_db()
 app = mcp.streamable_http_app()
 app.router.routes.extend([
@@ -293,6 +365,8 @@ app.router.routes.extend([
     Route("/poll", rest_poll),
     Route("/peek", rest_peek),
     Route("/boxes", rest_boxes),
+    Route("/register", rest_register, methods=["POST"]),
+    Route("/history", rest_history),
 ])
 
 if __name__ == "__main__":
