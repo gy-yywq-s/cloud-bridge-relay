@@ -128,6 +128,10 @@ def init_db():
       code TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
       pool_code TEXT NOT NULL DEFAULT '',
       coordinator TEXT NOT NULL, created_ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS setup_state(
+      team_code TEXT PRIMARY KEY, step_id TEXT NOT NULL DEFAULT '',
+      answers TEXT NOT NULL DEFAULT '{}', done INTEGER NOT NULL DEFAULT 0,
+      started_ts TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS owner_mailbox(
       id INTEGER PRIMARY KEY CHECK (id=1),
       full_name TEXT NOT NULL, alias TEXT NOT NULL, email TEXT NOT NULL,
@@ -832,6 +836,7 @@ def do_initialize_team(pool_code, coordinator_box):
                     f"team {code} ({len(ordered)} members; coordinator: "
                     f"{coordinator_box}). KEEP POLLING your box; setup notices "
                     f"will follow. Use list_team('{code}') for the roster.")
+    wiz_save(code, "", {}, 0)
     return {"ok": True, **team_roster(code),
             "directive": ("TEAM CREATED AND YOU ARE THE COORDINATOR (member #1). "
                           "NOW RUN THE SETUP CENTER WITH THE OWNER, IN ORDER: "
@@ -843,9 +848,14 @@ def do_initialize_team(pool_code, coordinator_box):
                           "which are WORKERS, or none -> set_box_role. "
                           "4) ask whether to attach the owner mailbox -> "
                           "attach_owner_to_team (set it up first if missing). "
-                          "5) report the final team card back to the owner. "
-                          "Setup can be revisited any time; every change "
-                          "broadcasts to the team.")}
+                          "NOW CALL setup_next(\"" + code + "\") AND RUN THE "
+                          "INTERVIEW: it hands you one question at a time to "
+                          "read to the owner verbatim (name, member aliases, "
+                          "manager/worker, owner mailbox, contact rules). "
+                          "Configuration setters are REFUSED until that "
+                          "interview is finished — this is not free-form "
+                          "work. Setup is revisitable: "
+                          "setup_next(restart=true).")}
 
 
 def do_join_team(code, box):
@@ -988,6 +998,385 @@ def do_history(box, limit=50):
     return {"received": out, "sent": sent_out}
 
 
+
+
+# ---------------- message templates (structure, not prose) -----------------
+# Free-form mail between agents drifts into essays and buries the ask. A
+# template is required for every message except "note": the server renders a
+# fixed shape and refuses missing fields, so recipients always know what they
+# are looking at and what is wanted from them.
+TEMPLATES = {
+    "status": {"fields": ["done", "next"], "optional": ["blockers", "eta"],
+               "use": "routine progress update"},
+    "milestone": {"fields": ["headline", "detail"], "optional": ["numbers"],
+                  "use": "a named checkpoint was reached (owner-worthy)"},
+    "blocker": {"fields": ["blocked_on", "tried", "need"], "optional": ["impact"],
+                "use": "work has stopped and you need something"},
+    "question": {"fields": ["question", "why_it_matters"],
+                 "optional": ["options", "your_recommendation"],
+                 "use": "a decision you cannot make alone"},
+    "handoff": {"fields": ["task", "context", "deliverable"],
+                "optional": ["deadline", "constraints"],
+                "use": "assigning work to someone"},
+    "result": {"fields": ["task", "outcome"], "optional": ["evidence", "caveats"],
+               "use": "reporting finished work back"},
+    "note": {"fields": [], "optional": [], "use": "anything else; body is free text"},
+}
+
+
+def render_template(template, fields, body):
+    t = TEMPLATES.get(template)
+    if t is None:
+        return None, {"error": "unknown_template",
+                      "templates": {k: v["use"] for k, v in TEMPLATES.items()}}
+    fields = fields or {}
+    if template == "note":
+        if not (body or "").strip():
+            return None, {"error": "empty_body"}
+        return f"[NOTE]\n{body.strip()}", None
+    missing = [f for f in t["fields"] if not str(fields.get(f, "")).strip()]
+    if missing:
+        return None, {"error": "missing_fields", "template": template,
+                      "missing": missing, "optional": t["optional"],
+                      "detail": f"template '{template}' ({t['use']}) requires: "
+                                + ", ".join(t["fields"])}
+    lines = [f"[{template.upper()}]"]
+    for f in t["fields"] + t["optional"]:
+        v = str(fields.get(f, "")).strip()
+        if v:
+            label = f.replace("_", " ")
+            lines.append(f"{label}: {v}" if "\n" not in v
+                         else f"{label}:\n" + "\n".join("  " + l for l in v.splitlines()))
+    if (body or "").strip():
+        lines.append("")
+        lines.append(body.strip())
+    return "\n".join(lines), None
+
+
+# ---------------- setup wizard (server-driven, one question at a time) ------
+# The whole point: the flow is STATE ON THE SERVER, not advice in a prompt.
+# A coordinator cannot configure a team by calling setters directly — those
+# are refused until the wizard is finished. It must call setup_next, read the
+# question to the owner VERBATIM, and submit the owner's answer.
+
+def wiz_row(code):
+    return db().execute("SELECT * FROM setup_state WHERE team_code=?",
+                        (code,)).fetchone()
+
+
+def wiz_answers(code):
+    r = wiz_row(code)
+    return json.loads(r["answers"]) if r else {}
+
+
+def wiz_save(code, step_id, answers, done=0):
+    db().execute(
+        "INSERT INTO setup_state(team_code,step_id,answers,done,started_ts) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(team_code) DO UPDATE SET "
+        "step_id=excluded.step_id, answers=excluded.answers, done=excluded.done",
+        (code, step_id, json.dumps(answers), done, now()))
+    db().commit()
+
+
+def wiz_pending(code):
+    """True while this team still has to go through the wizard."""
+    r = wiz_row(code)
+    return not (r and r["done"])
+
+
+def wiz_steps(code):
+    """Ordered step list for this team, computed from current state."""
+    members = [m for m in team_roster(code, "full")["members"]
+               if m["box"] != OWNER_BOX]
+    t = db().execute("SELECT * FROM teams WHERE code=?", (code,)).fetchone()
+    o = owner_row()
+    steps = [{
+        "id": "team_name",
+        "ask": ("What should this team be called? (I'll use the name in every "
+                "member's display name, e.g. \"<name>-2\".)"),
+        "options": ["<any name>", "default"],
+        "default": "crew-" + code.replace("tm-", ""),
+        "answer_format": "a short name, or the word 'default'",
+    }]
+    for m in members:
+        steps.append({
+            "id": f"alias_{m['member_no']}",
+            "ask": (f"Member #{m['member_no']} is box {m['box']} "
+                    f"({m['platform']}, {m['environment'] or 'no env given'}"
+                    + (f", session \"{m['session_name']}\"" if m["session_name"] else "")
+                    + "). What name should they display as?"),
+            "options": ["<any name>", "default"],
+            "default": "",  # resolved at apply time -> <team>-<no>
+            "answer_format": "a name, or 'default' to keep <team-name>-<number>",
+        })
+    steps.append({
+        "id": "manager",
+        "ask": ("Who handles contact with you (the owner)? Give the member "
+                "number of the MANAGER — everyone else becomes a WORKER and "
+                "is hard-blocked from mailing you. Answer 'none' for no "
+                "chain of command."),
+        "options": [str(m["member_no"]) for m in members] + ["none"],
+        "default": "none",
+        "answer_format": "a member number, or 'none'",
+    })
+    if not (o and o["confirmed"]):
+        steps.append({
+            "id": "owner_setup",
+            "ask": ("No owner mailbox exists yet. Do you want one? It lets the "
+                    "team reach you by real email, with rules about who may "
+                    "write and when. Answer 'yes' to set it up now (I'll ask "
+                    "for your name and email), or 'skip'."),
+            "options": ["yes", "skip"], "default": "skip",
+            "answer_format": "'yes' or 'skip'",
+        })
+    else:
+        steps.append({
+            "id": "owner_attach",
+            "ask": (f"Attach your owner mailbox ({o['alias']} / {o['email']}) "
+                    "to this team, so members can cc you?"),
+            "options": ["yes", "no"], "default": "yes",
+            "answer_format": "'yes' or 'no'",
+        })
+        steps.append({
+            "id": "owner_mode",
+            "ask": ("How should the team be allowed to contact you?\n"
+                    "  a = milestones only (default): manager only, cc only, "
+                    "direct mail needs a justification\n"
+                    "  b = manager-open: manager only, direct mail allowed\n"
+                    "  c = team-open: anyone may cc you, direct still justified\n"
+                    "  d = custom: describe it in your own words and I'll turn "
+                    "it into rules and read them back"),
+            "options": ["a", "b", "c", "d"], "default": "a",
+            "answer_format": "'a', 'b', 'c', or 'd' (for d, add your wording)",
+        })
+    return steps
+
+
+def wiz_apply(code, step_id, answer):
+    """Apply one answered step. Returns (ok, extra_dict_or_error)."""
+    ans = (answer or "").strip()
+    low = ans.lower()
+    steps = {s["id"]: s for s in wiz_steps(code)}
+    step = steps.get(step_id)
+    if not step:
+        return False, {"error": "unknown_step", "detail": list(steps)}
+    use_default = low in ("default", "skip", "") and step_id != "owner_mode"
+    if step_id == "team_name":
+        do_set_team_name(code, step["default"] if use_default else ans)
+    elif step_id.startswith("alias_"):
+        if not use_default:
+            no = int(step_id.split("_")[1])
+            r = do_set_member_alias(code, no, ans, override_name=False)
+            if r.get("error") == "name_taken":
+                return False, {"error": "name_taken", "conflict_with": r.get("conflict_with"),
+                               "ask_owner_verbatim": (
+                                   f"The name \"{ans}\" is already used by another "
+                                   "member. Pick a different one, or say "
+                                   "'force' to use it anyway."),
+                               "detail": "resubmit this same step_id with a new "
+                                         "name, or with the word 'force'"}
+        # 'force' path
+        if low == "force":
+            return False, {"error": "need_name_with_force",
+                           "detail": "answer as 'force <name>'"}
+    elif step_id == "manager":
+        if low not in ("none", ""):
+            try:
+                mgr = int(low)
+            except ValueError:
+                return False, {"error": "bad_answer", "detail": step["answer_format"]}
+            for m in team_roster(code, "full")["members"]:
+                if m["box"] == OWNER_BOX:
+                    continue
+                do_set_box_role(code, m["member_no"],
+                                "manager" if m["member_no"] == mgr else "worker")
+    elif step_id == "owner_setup":
+        if low == "yes":
+            return True, {"handoff": "owner_mailbox",
+                          "directive": ("The owner wants a mailbox. RUN THE "
+                                        "add-owner-mailbox FLOW NOW "
+                                        "(setup_owner_mailbox -> owner "
+                                        "confirms receipt -> "
+                                        "confirm_owner_mailbox), then call "
+                                        "setup_next again — the wizard will "
+                                        "pick up with attaching it.")}
+    elif step_id == "owner_attach":
+        if low in ("yes", "y"):
+            do_attach_owner(code)
+    elif step_id == "owner_mode":
+        mode = low.split()[0] if low else "a"
+        if mode not in OWNER_MODES:
+            return False, {"error": "bad_answer", "detail": step["answer_format"]}
+        if mode == "d":
+            return True, {"handoff": "owner_mode_custom", "owner_words": ans,
+                          "directive": ("Mode d: turn the owner's wording into "
+                                        "(1) a short hard-rules text, (2) "
+                                        "allow_senders manager_only|any, (3) "
+                                        "allow_direct justified_only|free. READ "
+                                        "THEM BACK, get an explicit yes, ask if "
+                                        "it should be permanent, then call "
+                                        "set_owner_mode(mode='d', ...). Then "
+                                        "call setup_next again.")}
+        do_set_owner_mode(mode)
+    return True, {}
+
+
+def wiz_next(code, restart=False):
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
+        return {"error": "no_such_team"}
+    if restart:
+        wiz_save(code, "", {}, 0)
+    answers = wiz_answers(code)
+    for step in wiz_steps(code):
+        if step["id"] in answers:
+            continue
+        wiz_save(code, step["id"], answers, 0)
+        done_n, total = len(answers), len(wiz_steps(code))
+        return {
+            "step_id": step["id"],
+            "progress": f"{done_n + 1}/{total}",
+            "ask_owner_verbatim": step["ask"],
+            "options": step["options"],
+            "default_if_owner_says_default": step["default"] or "<team-name>-<number>",
+            "answer_format": step["answer_format"],
+            "directive": ("ASK THE OWNER THIS QUESTION, VERBATIM, AND NOTHING "
+                          "ELSE. Do not guess, do not batch several questions, "
+                          "do not proceed on your own. When the owner answers, "
+                          "call setup_answer(code, step_id, answer) with their "
+                          "words — 'default' is a valid answer. Configuration "
+                          "setters stay REFUSED until this wizard is done."),
+        }
+    wiz_save(code, "", answers, 1)
+    roster = team_roster(code, "full")
+    broadcast_team(code, "SETUP COMPLETE for this team.\n\n" + roster["team_card"])
+    return {"done": True, "summary": roster["team_card"],
+            "answers": answers,
+            "directive": ("SETUP IS COMPLETE. Show the owner this team card "
+                          "verbatim as the final confirmation. Configuration "
+                          "setters are now unlocked for later edits, and "
+                          "setup_next(restart=true) re-runs the whole "
+                          "interview.")}
+
+
+def wiz_answer(code, step_id, answer):
+    r = wiz_row(code)
+    if r and r["done"]:
+        return {"error": "setup_already_done",
+                "detail": "use the setters directly, or setup_next(restart=true)"}
+    if not r or r["step_id"] != step_id:
+        return {"error": "wrong_step",
+                "expected": r["step_id"] if r else None,
+                "detail": "call setup_next to get the current question"}
+    ok, extra = wiz_apply(code, step_id, answer)
+    if not ok:
+        return extra
+    answers = wiz_answers(code)
+    answers[step_id] = answer
+    wiz_save(code, step_id, answers, 0)
+    if extra.get("handoff"):
+        return {"ok": True, "recorded": answer, **extra}
+    return {"ok": True, "recorded": answer, "next": wiz_next(code)}
+
+
+def wiz_guard(code):
+    """Setters call this: configuration is wizard-only until setup is done."""
+    if wiz_pending(code):
+        return {"error": "setup_wizard_required",
+                "directive": ("This team has not been set up yet, and "
+                              "configuration is NOT free-form: call "
+                              "setup_next(code) and answer its questions with "
+                              "the owner. That flow applies every setting. "
+                              "Direct setters unlock once setup is complete.")}
+    return None
+
+
+
+CLIENT_PY = r'''"""crew client — one import instead of ten hand-rolled HTTP calls.
+
+    curl -sO https://relay.gaelis.cc/client/python && mv python crew_client.py
+
+    from crew_client import Crew
+    crew = Crew("https://relay.gaelis.cc", "hostd_...")      # your credential
+    me = crew.register(platform="codex", environment="mac / local",
+                       pool_code="1234", session_name="Nova")
+    for msg in crew.inbox(wait=50):        # yields mail, acks after each one
+        if msg["delivered_as"] == "cc":
+            continue                        # cc = read only, never act
+        crew.send(["bx-..."], "result", task="...", outcome="...")
+
+Stdlib only. Box ids are server-assigned and cached in ~/.crew_box_id.
+"""
+import json
+import os
+import urllib.request
+
+STATE = os.path.expanduser("~/.crew_box_id")
+
+
+class CrewError(RuntimeError):
+    pass
+
+
+class Crew:
+    def __init__(self, base, token, box=None, ua="crew-client/1"):
+        self.base = base.rstrip("/")
+        self.h = {"Authorization": "Bearer " + token, "User-Agent": ua}
+        self.box = box or (open(STATE).read().strip()
+                           if os.path.exists(STATE) else None)
+
+    def _call(self, path, payload=None, timeout=70):
+        req = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(payload).encode() if payload is not None else None,
+            headers=dict(self.h, **({"Content-Type": "application/json"}
+                                    if payload is not None else {})))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read().decode())
+        if isinstance(out, dict) and out.get("error"):
+            raise CrewError(out)
+        return out
+
+    # --- lifecycle --------------------------------------------------------
+    def register(self, platform, environment, pool_code, session_name="",
+                 role="", override_name=False):
+        p = {"platform": platform, "environment": environment,
+             "pool_code": pool_code, "session_name": session_name,
+             "role": role, "override_name": override_name}
+        if self.box:
+            p["box_id"] = self.box
+        out = self._call("/register", p)
+        self.box = out["box"]
+        open(STATE, "w").write(self.box)
+        return out
+
+    def team(self, code, view="brief"):
+        return self._call("/team?code=%s&view=%s" % (code, view))
+
+    # --- mail -------------------------------------------------------------
+    def send(self, to, template="note", cc=None, body="", **fields):
+        return self._call("/send", {
+            "from": self.box, "to": to, "cc": cc or [],
+            "template": template, "fields": fields, "body": body})
+
+    def check(self, wait=25):
+        return self._call("/checkmail?box=%s&wait=%d" % (self.box, wait))["messages"]
+
+    def ack(self, through_id):
+        return self._call("/ack", {"box": self.box, "through_id": through_id})
+
+    def inbox(self, wait=50, once=False):
+        """Yield messages, acking each only AFTER your loop body ran.
+
+        Crash-safe: anything you did not finish is redelivered next time.
+        """
+        while True:
+            for m in self.check(wait):
+                yield m
+                self.ack(m["id"])
+            if once:
+                return
+'''
+
 USAGE = {
     "service": "crew",
     "v": 5.1,
@@ -1001,6 +1390,7 @@ USAGE = {
                "card footer."),
     "mcp": {"endpoint": "/mcp", "transport": "streamable-http",
             "prompts": ["onboard", "setup", "add-owner-mailbox", "team-status"]},
+    "flow_is_enforced": ("Team configuration runs as a server-driven interview: setup_next gives one question at a time with the exact wording to read to the owner, setup_answer applies it. The direct setters are refused until that interview completes, so no session can improvise setup. Mail is templated (status/milestone/blocker/question/handoff/result/note) and missing required fields are refused."),
     "delivery": {
         "how_you_receive_depends_on_how_you_were_STARTED": (
             "crew is store-and-forward mail. There is NO push tool in this "
@@ -1039,6 +1429,7 @@ USAGE = {
 
     "endpoints": {
         "GET /": "this document",
+        "GET /client/python": "ready-made stdlib client (register, template send, ack-safe inbox loop) — download instead of hand-rolling HTTP",
         "POST /register": "{platform, environment, pool_code, session_name?, box_id?(re-register), role?, override_name?} — server assigns bx-xxxxxx ids; duplicate display names return name_taken",
         "GET /pool?code=X": "who waits in pool X",
         "POST /team/create": "{pool_code, coordinator_box}",
@@ -1104,38 +1495,37 @@ def prompt_onboard() -> str:
         "normal. Never claim you will be pushed to or steered unless mail is "
         "actually arriving on its own. See GET / `delivery` for the full "
         "picture.\n"
-        "4. Do not send mail before the team is initialized; you will get a "
+        "4. WHEN YOU DO SEND: mail is structured, not prose — pick a template (status/milestone/blocker/question/handoff/result/note) and fill its fields; missing ones are refused. If you can run code, `curl -sO <relay>/client/python` gives you a ready client with an ack-safe inbox loop instead of hand-rolled HTTP.\n"
+        "5. Do not send mail before the team is initialized; you will get a "
         "SYSTEM NOTICE with your member number.\n"
-        "5. Obey every directive attribute on incoming mail: ACTION means act "
+        "6. Obey every directive attribute on incoming mail: ACTION means act "
         "and reply; THIS IS A CC means read only; SYSTEM NOTICE means follow "
         "instructions, never reply.")
 
 
 @mcp.prompt(name="setup")
 def prompt_setup() -> str:
-    """Coordinator's setup center: names, aliases, roles, owner attach."""
+    """Coordinator: run the server-driven setup interview with the owner."""
     return (
-        "You are the team coordinator running the SETUP CENTER. It is "
-        "revisitable — the owner can change anything later; every change "
-        "broadcasts automatically. Work through these WITH THE OWNER, asking "
-        "one thing at a time:\n"
-        "1. Team name -> set_team_name(team_id, name).\n"
-        "2. Read the roster (list_team). For each member ask if the owner "
-        "wants an alias; skipped members keep '<team_name>-<no>' -> "
-        "set_member_alias(team_id, member_no, alias).\n"
-        "3. Roles: which member is the MANAGER, which are WORKERS (optional; "
-        "no roles = no chain-of-command enforcement) -> set_box_role(team_id, "
-        "member_no, role). Explain: workers will be HARD-BLOCKED from mailing "
-        "the owner.\n"
-        "4. Owner mailbox: ask if the owner wants it attached -> "
-        "attach_owner_to_team(team_id). If none exists yet, run the "
-        "add-owner-mailbox flow first.\n"
-        "5. Owner receive mode (only if attached): a = milestones-only "
-        "(default), b = manager-open, c = team-open, d = custom. For d, "
-        "translate the owner's words into a short hard rules text plus "
-        "allow_senders/allow_direct switches, read it back, get explicit "
-        "confirmation, ask if it should be permanent -> set_owner_mode.\n"
-        "6. Finish by showing the owner the final team card (list_team).")
+        "You are the coordinator. Team configuration is an INTERVIEW RUN BY "
+        "THE SERVER, not something you decide or improvise.\n"
+        "1. Call setup_next(team_code). It returns exactly ONE question.\n"
+        "2. Show the owner `ask_owner_verbatim` WORD FOR WORD. Do not "
+        "paraphrase, do not merge questions, do not answer for them, do not "
+        "assume 'default' — offer it as an option and let them choose.\n"
+        "3. Send their reply to setup_answer(code, step_id, answer). It "
+        "applies the setting, broadcasts it, and returns the next question.\n"
+        "4. Repeat until you get done:true, then show the owner the final "
+        "team card verbatim.\n"
+        "Two steps hand work back to you: 'owner_setup' (run the "
+        "add-owner-mailbox flow, then call setup_next again) and mode 'd' "
+        "(translate the owner's wording into hard rules, read them back, get "
+        "an explicit yes, call set_owner_mode, then setup_next again).\n"
+        "set_team_name / set_member_alias / set_box_role / "
+        "attach_owner_to_team are REFUSED until the interview finishes — that "
+        "is deliberate. Afterwards they work for one-off edits, and "
+        "setup_next(restart=true) re-runs the whole interview."
+    )
 
 
 @mcp.prompt(name="add-owner-mailbox")
@@ -1216,7 +1606,8 @@ async def join_team(code: str, box: str) -> dict:
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_team_name(code: str, name: str) -> dict:
     """Setup center: set the team name the owner chose. Broadcasts."""
-    return do_set_team_name(code, name)
+    g = wiz_guard(str(code))
+    return g or do_set_team_name(code, name)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -1225,14 +1616,16 @@ async def set_member_alias(code: str, member_no: int, alias: str,
     """Setup center: set the alias the owner chose for one member. Duplicate
     display names return name_taken — read it to the owner and retry with
     override_name=true only on the owner's explicit approval. Broadcasts."""
-    return do_set_member_alias(code, member_no, alias, override_name)
+    g = wiz_guard(str(code))
+    return g or do_set_member_alias(code, member_no, alias, override_name)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_box_role(code: str, member_no: int, role: str) -> dict:
     """Setup center: mark a member 'manager' or 'worker' (owner's choice).
     HARD consequence: workers can never mail the owner. Broadcasts."""
-    return do_set_box_role(code, member_no, role)
+    g = wiz_guard(str(code))
+    return g or do_set_box_role(code, member_no, role)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -1268,7 +1661,34 @@ async def set_owner_mode(mode: str, custom_rules: str = "",
 async def attach_owner_to_team(code: str) -> dict:
     """Setup center: attach the confirmed owner mailbox to a team as member #0
     (owner + human). Broadcasts the owner contact rules to everyone."""
-    return do_attach_owner(code)
+    g = wiz_guard(str(code))
+    return g or do_attach_owner(code)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def setup_next(code: str, restart: bool = False) -> dict:
+    """THE ONLY WAY TO CONFIGURE A TEAM. Returns ONE question at a time.
+
+    Read `ask_owner_verbatim` to the owner exactly as written — do not
+    paraphrase it, do not ask several questions at once, do not answer on the
+    owner's behalf, and do not skip ahead. 'default' is always a valid answer
+    and `default_if_owner_says_default` tells you what it means. Submit what
+    the owner said with setup_answer, which hands you the next question.
+    restart=true re-runs the whole interview (settings are revisitable).
+    """
+    return wiz_next(str(code), restart)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def setup_answer(code: str, step_id: str, answer: str) -> dict:
+    """Submit the owner's answer to the question setup_next just gave you.
+
+    Pass the owner's words (or 'default'). The server validates, applies the
+    setting, broadcasts the change, and returns the next question. Answering a
+    step you were not asked is refused — that is deliberate: the interview is
+    server-driven so no session can improvise its way through setup.
+    """
+    return wiz_answer(str(code), str(step_id), answer)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -1281,12 +1701,23 @@ async def list_team(code: str, view: str = "brief") -> dict:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def send_mail(sender_box: str, to: list[str], body: str,
+async def send_mail(sender_box: str, to: list[str], template: str = "note",
+                    fields: dict | None = None, body: str = "",
                     cc: list[str] | None = None,
                     owner_justification: str = "",
                     dedup_key: str = "") -> dict:
-    """Send a message. to = must act; cc = FYI copy. Identity/platform/role
-    stamps come from your registration. Mailing box 'owner' is HARD-GATED by
+    """Send a message. to = must act; cc = FYI copy.
+
+    STRUCTURE IS REQUIRED, not prose. Pick a template and fill its fields:
+      status(done,next) · milestone(headline,detail) ·
+      blocker(blocked_on,tried,need) · question(question,why_it_matters) ·
+      handoff(task,context,deliverable) · result(task,outcome) ·
+      note(free text in body)
+    Missing required fields are refused with the list. `body` is optional
+    extra prose appended under the structured part.
+
+    Identity/platform/role stamps come from your registration. Mailing box
+    'owner' is HARD-GATED by
     the owner mode: workers are always refused; a direct `to` may require
     owner_justification (one sentence: why the owner must see this NOW).
 
@@ -1295,7 +1726,10 @@ async def send_mail(sender_box: str, to: list[str], body: str,
     an explicit error instead. If the response gets lost and you retry, pass
     the same dedup_key (any string unique to this logical message): retries
     then return the original id with duplicate:true instead of double-sending."""
-    res, err = do_send(sender_box, to, cc or [], body,
+    rendered, terr = render_template(template, fields, body)
+    if terr:
+        return terr
+    res, err = do_send(sender_box, to, cc or [], rendered,
                        owner_justification=owner_justification,
                        dedup_key=dedup_key)
     return res if res else err
@@ -1379,6 +1813,11 @@ async def _r_root(_req, _p):
     return USAGE
 
 
+async def _r_client_py(_req):
+    from starlette.responses import PlainTextResponse
+    return PlainTextResponse(CLIENT_PY)
+
+
 async def _r_health(_req, _p):
     return {"ok": True}
 
@@ -1401,10 +1840,14 @@ async def _r_team_join(_req, p):
 
 
 async def _r_team_name(_req, p):
-    return do_set_team_name(p.get("code", ""), p.get("name", ""))
+    g = wiz_guard(p.get("code", ""))
+    return g or do_set_team_name(p.get("code", ""), p.get("name", ""))
 
 
 async def _r_team_alias(_req, p):
+    g = wiz_guard(p.get("code", ""))
+    if g:
+        return g
     try:
         return do_set_member_alias(p.get("code", ""), int(p.get("member_no", 0)),
                                    p.get("alias", ""),
@@ -1414,6 +1857,9 @@ async def _r_team_alias(_req, p):
 
 
 async def _r_team_role(_req, p):
+    g = wiz_guard(p.get("code", ""))
+    if g:
+        return g
     try:
         return do_set_box_role(p.get("code", ""), int(p.get("member_no", 0)),
                                p.get("role", ""))
@@ -1422,7 +1868,8 @@ async def _r_team_role(_req, p):
 
 
 async def _r_attach_owner(_req, p):
-    return do_attach_owner(p.get("code", ""))
+    g = wiz_guard(p.get("code", ""))
+    return g or do_attach_owner(p.get("code", ""))
 
 
 async def _r_owner_setup(_req, p):
@@ -1440,6 +1887,14 @@ async def _r_owner_mode(_req, p):
                              p.get("persistent"))
 
 
+async def _r_setup_next(_req, p):
+    return wiz_next(p.get("code", ""), bool(p.get("restart")))
+
+
+async def _r_setup_answer(_req, p):
+    return wiz_answer(p.get("code", ""), p.get("step_id", ""), p.get("answer", ""))
+
+
 async def _r_team(req, _p):
     view = req.query_params.get("view", "brief")
     return team_roster(req.query_params.get("code", ""),
@@ -1451,8 +1906,12 @@ async def _r_pool(req, _p):
 
 
 async def _r_send(_req, p):
+    rendered, terr = render_template(p.get("template", "note"),
+                                     p.get("fields"), p.get("body", ""))
+    if terr:
+        return terr
     res, err = do_send(p.get("from", ""), p.get("to"), p.get("cc"),
-                       p.get("body", ""), fallback_alias=p.get("alias", ""),
+                       rendered, fallback_alias=p.get("alias", ""),
                        owner_justification=p.get("owner_justification", ""),
                        dedup_key=p.get("dedup_key", ""))
     return res if res else err
@@ -1521,6 +1980,7 @@ app = mcp.streamable_http_app()
 app.router.routes.extend([
     Route("/", _json_route(_r_root)),
     Route("/health", _json_route(_r_health)),
+    Route("/client/python", _r_client_py),
     Route("/register", _json_route(_r_register), methods=["POST"]),
     Route("/team/create", _json_route(_r_team_create), methods=["POST"]),
     Route("/team/join", _json_route(_r_team_join), methods=["POST"]),
@@ -1531,6 +1991,8 @@ app.router.routes.extend([
     Route("/owner/setup", _json_route(_r_owner_setup), methods=["POST"]),
     Route("/owner/confirm", _json_route(_r_owner_confirm), methods=["POST"]),
     Route("/owner/mode", _json_route(_r_owner_mode), methods=["POST"]),
+    Route("/setup/next", _json_route(_r_setup_next), methods=["POST"]),
+    Route("/setup/answer", _json_route(_r_setup_answer), methods=["POST"]),
     Route("/team", _json_route(_r_team)),
     Route("/pool", _json_route(_r_pool)),
     Route("/send", _json_route(_r_send), methods=["POST"]),
