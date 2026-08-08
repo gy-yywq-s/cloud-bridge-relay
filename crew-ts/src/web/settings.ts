@@ -38,9 +38,13 @@ export function settingsRoutes(ctrl: Ctx): Hono {
 
     // ── appearance ─────────────────────────────────────────────────────────
     const swatches = ["#2563eb", "#4f46e5", "#0ea5a4", "#0284c7", "#7c3aed", "#e11d48", "#ea580c", "#059669"];
-    const fontCards = FONT_SETS.map((f) => `
+    // Font stacks contain quotes, so they cannot be interpolated into a quoted
+    // style attribute (it truncates, and every card previewed the same face).
+    // Emit real CSS classes instead.
+    const fontCss = `<style>${FONT_SETS.map((f) => `.pv-${f.key}{font-family:${f.display || f.sans}}`).join("")}</style>`;
+    const fontCards = fontCss + FONT_SETS.map((f) => `
       <label><input type="radio" name="font" value="${f.key}"${brand.font === f.key ? " checked" : ""}>
-        <span class="fs"><b style="font-family:${f.display || f.sans}">${esc(f.label)}</b><span class="note">${esc(f.note)}</span></span></label>`).join("");
+        <span class="fs"><b class="pv-${f.key}">${esc(f.label)}</b><span class="note">${esc(f.note)}</span></span></label>`).join("");
     const appearance = canInstance(id) ? `
       <div class="card"><h2>${icon("spark", 16)} Appearance</h2>
         <p class="hint" style="margin:0 0 4px">Name, accent colour and typeface for this instance. Applies everywhere, immediately.</p>
@@ -48,17 +52,17 @@ export function settingsRoutes(ctrl: Ctx): Hono {
           <label>Instance name</label><input name="brand_name" value="${esc(brand.name)}" maxlength="40">
           <label>Accent colour</label>
           <div class="row">
-            <input type="color" name="accent" id="accent" value="${esc(brand.accent)}" style="width:56px;height:42px;padding:4px">
-            <input type="text" name="accent_hex" id="accent_hex" value="${esc(brand.accent)}" pattern="#[0-9a-fA-F]{6}" style="width:130px;font-family:var(--mono)">
-            <span class="row" id="swatches" style="gap:6px">${swatches.map((h) => `<button type="button" class="sw" data-h="${h}" title="${h}" style="width:24px;height:24px;border-radius:7px;border:1px solid var(--rule);background:${h};cursor:pointer"></button>`).join("")}</span>
+            <input type="color" name="accent" id="accent" value="${esc(brand.accent)}" aria-label="Accent colour" style="width:56px;height:42px;padding:4px">
+            <span class="row" id="swatches" style="gap:6px">${swatches.map((h) => `<button type="button" class="sw" data-h="${h}" title="${h}" aria-label="Use ${h}" style="width:26px;height:26px;border-radius:8px;border:1px solid var(--rule);background:${h};cursor:pointer"></button>`).join("")}</span>
+            <code id="accent_hex_label" class="muted">${esc(brand.accent)}</code>
           </div>
           <label>Typeface</label><div class="fontpick">${fontCards}</div>
           <button class="btn" style="margin-top:18px">${icon("check", 15)}Save appearance</button>
         </form>
-        <script>(function(){var c=document.getElementById('accent'),h=document.getElementById('accent_hex');
-          c.addEventListener('input',function(){h.value=c.value;});
-          h.addEventListener('input',function(){if(/^#[0-9a-fA-F]{6}$/.test(h.value))c.value=h.value;});
-          document.querySelectorAll('#swatches .sw').forEach(function(b){b.addEventListener('click',function(){c.value=b.dataset.h;h.value=b.dataset.h;});});})();</script>
+        <script>(function(){var c=document.getElementById('accent'),l=document.getElementById('accent_hex_label');
+          function show(){l.textContent=c.value;document.documentElement.style.setProperty('--accent',c.value);}
+          c.addEventListener('input',show);
+          document.querySelectorAll('#swatches .sw').forEach(function(b){b.addEventListener('click',function(){c.value=b.dataset.h;show();});});})();</script>
       </div>` : "";
 
     // ── owner mailbox (the same thing agents configure over the connector) ──
@@ -109,11 +113,6 @@ export function settingsRoutes(ctrl: Ctx): Hono {
         </form>
       </div>` : "";
 
-    const themeCard = `
-      <div class="card"><h2>${icon("sun", 16)} Theme</h2>
-        <p class="hint" style="margin:0 0 10px">Light or dark follows your system. Override for this browser:</p>
-        <button class="btn ghost" type="button" onclick="__toggleTheme()">${icon("moon", 15)}Toggle light / dark</button></div>`;
-
     const accountCard = (id != null && id >= 1) ? `
       <div class="card danger-zone"><h2>${icon("trash", 16)} Delete account</h2>
         <p class="hint" style="margin:0 0 10px">Permanently deletes <b>${esc(email)}</b> and ${ctrl.cfg.mode === "cloud" ? "your entire isolated crew (teams, mail, tasks)" : "your account"}. This cannot be undone.</p>
@@ -122,7 +121,7 @@ export function settingsRoutes(ctrl: Ctx): Hono {
           <button class="btn danger" style="margin-top:14px">${icon("trash", 15)}Delete my account</button>
         </form></div>` : "";
 
-    const body = appearance + ownerCard + tunableCards + themeCard + accountCard;
+    const body = appearance + ownerCard + tunableCards + accountCard;
     return ctx.html(appShell({ title: "Settings", nav: navFor("settings", isAdmin(ctrl, id)), body, account: email, toast }));
   });
 
@@ -131,7 +130,7 @@ export function settingsRoutes(ctrl: Ctx): Hono {
     if (ctrl.cfg.mode !== "local" && id == null) return ctx.redirect("/login");
     if (!canInstance(id)) return ctx.redirect("/settings");
     const b = await ctx.req.parseBody();
-    setBrand(ctrl, { name: String(b.brand_name || ""), accent: String(b.accent_hex || b.accent || "").trim(), font: String(b.font || "") });
+    setBrand(ctrl, { name: String(b.brand_name || ""), accent: String(b.accent || "").trim(), font: String(b.font || "") });
     return ctx.redirect("/settings?saved=1");
   });
 

@@ -3,12 +3,12 @@
 // never sees another's crew.
 import { Hono } from "hono";
 import type { Ctx } from "../core/context.js";
-import { appShell, esc } from "./theme.js";
+import { appShell, esc, liveRefreshScript } from "./theme.js";
 import { icon } from "./icons.js";
 import { navFor } from "./nav.js";
-import { rosterText, teamViewKey } from "../core/context.js";
+import { teamViewKey } from "../core/context.js";
 import { doPool, doInitializeTeam, doSetTeamName, doSetBoxRole, fullMembers } from "../core/teams.js";
-import { boardText } from "../core/tasks.js";
+import { renderBoard, renderRoster } from "./render.js";
 import { wizPending } from "../core/wizard.js";
 import { getSession, isAdmin } from "../auth/accounts.js";
 import { tenantCtx } from "../core/tenancy.js";
@@ -68,7 +68,7 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
     const empty = boxes.length === 0;
     const connect = `
       <details class="card"${empty ? " open" : ""}>
-        <summary style="cursor:pointer;list-style:none"><h2 style="margin:0">${icon("link", 16)} Connect a session${empty ? "" : ` <span class="muted small" style="font-weight:400">— MCP URL and commands</span>`}</h2></summary>
+        <summary><h2 style="margin:0">${icon("link", 16)} Connect a session${empty ? "" : ` <span class="muted small" style="font-weight:400">— MCP URL and commands</span>`}</h2><span class="chev">${icon("chevron", 16)}</span></summary>
         <p class="hint" style="margin:10px 0">Point Claude Code, Codex or claude.ai at this relay, then run <code>/crew:onboard &lt;pool&gt;</code> in each session. The first connection opens a browser to sign in.</p>
         <div class="row"><code class="grow" style="overflow-x:auto">${esc(mcpUrl)}</code>
           <button type="button" class="copy" data-copy="${esc(mcpUrl)}">${icon("copy", 13)}copy</button></div>
@@ -80,7 +80,7 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
       </details>`;
 
     const body = `${connect}
-      <div class="row" style="gap:14px;margin-bottom:18px">
+      <div class="stats">
         <div class="card stat">${icon("teams", 20)}<b>${teams.length}</b><span class="muted small">teams</span></div>
         <div class="card stat">${icon("dashboard", 20)}<b>${agents}</b><span class="muted small">agents</span></div>
         <div class="card stat">${icon("pool", 20)}<b>${pools.length}</b><span class="muted small">waiting pools</span></div>
@@ -100,14 +100,15 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
     const members = fullMembers(c, code);
     const roleForm = members.filter((m) => m.box !== "owner").map((m) =>
       `<tr><td>#${m.member_no} ${esc(m.display_name)}<div class="small muted">${esc(m.platform)} · ${esc(m.environment || "")}</div></td>
-       <td>${["manager", "worker"].map((r) => `<button class="btn sm ${m.role === r ? "" : "ghost"}" formaction="/app/team/${esc(code)}/role" name="set" value="${m.member_no}:${r}">${r}</button>`).join(" ")}</td>
+       <td><span class="row" style="gap:6px;flex-wrap:nowrap">${["manager", "worker"].map((r) => `<button class="btn sm ${m.role === r ? "" : "ghost"}" style="min-width:84px" aria-pressed="${m.role === r}" formaction="/app/team/${esc(code)}/role" name="set" value="${m.member_no}:${r}">${r}</button>`).join("")}${m.role ? "" : `<span class="chip warn">unassigned</span>`}</span></td>
        <td>${m.pending_mail ? `<span class="chip">${m.pending_mail} unread</span>` : ""}${m.stale ? `<span class="chip bad">stale</span>` : ""}</td></tr>`).join("");
     const t = c.db.prepare("SELECT name FROM teams WHERE code=?").get(code) as { name: string };
     const key = teamViewKey(c, code);
     const base = c.cfg.public_url || `http://${c.cfg.host}:${c.cfg.port}`;
     const shareUrl = `${base}/b/${key || ""}`;
     const body = `
-      <p class="crumb"><a href="/app">Dashboard</a> ${icon("chevron", 13)} ${esc(t.name || code)}</p>
+      <p class="crumb"><a href="/app">Dashboard</a> ${icon("chevron", 13)} <span>${esc(code)}</span></p>
+      <h1>${esc(t.name || "(unnamed team)")}</h1>
       <div class="card"><h2>${icon("settings", 16)} Team name</h2>
         <form method="post" action="/app/team/${esc(code)}/name" class="row">
           <div class="grow"><input name="name" value="${esc(t.name)}" placeholder="Team name"></div>
@@ -115,14 +116,14 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
       <div class="card"><h2>${icon("teams", 16)} Members &amp; roles</h2>
         <form method="post"><table><tbody>${roleForm || `<tr><td class="empty">No members yet.</td></tr>`}</tbody></table></form>
         <p class="hint">Workers can never mail the owner; that is enforced server-side.</p></div>
-      <div class="card"><h2>${icon("board", 16)} Task board</h2><pre id="board">${esc(boardText(c, code))}</pre></div>
-      <div class="card"><h2>${icon("user", 16)} Roster</h2><pre>${esc(rosterText(c, code))}</pre></div>
+      <div class="card"><h2>${icon("board", 16)} Task board</h2><div data-live="board">${renderBoard(c, code)}</div></div>
+      <div class="card"><h2>${icon("user", 16)} Roster</h2><div data-live="roster">${renderRoster(c, code)}</div></div>
       <div class="card"><h2>${icon("link", 16)} Share this board</h2>
         <p class="hint" style="margin:0 0 10px">A read-only link to this team's board and roster — no account needed. Safe to give someone who should watch progress.</p>
         <div class="row"><code class="grow" style="overflow-x:auto">${esc(shareUrl)}</code>
           <button type="button" class="copy" data-copy="${esc(shareUrl)}">${icon("copy", 13)}copy</button>
           <a class="btn sm ghost" href="/b/${esc(key || "")}" target="_blank" rel="noopener">open</a></div></div>
-      <script>setTimeout(()=>location.reload(), ${c.cfg.team.board_refresh_s * 1000});</script>`;
+      ${liveRefreshScript(c.cfg.team.board_refresh_s)}`;
     return ctx.html(H(id, "app", t.name || "Team", body));
   });
 

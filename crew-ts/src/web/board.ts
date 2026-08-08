@@ -4,10 +4,9 @@
 // it is safe to share with a human who should watch progress.
 import { Hono } from "hono";
 import type { Ctx } from "../core/context.js";
-import { authPage, esc } from "./theme.js";
+import { authPage, esc, liveRefreshScript } from "./theme.js";
 import { icon } from "./icons.js";
-import { rosterText } from "../core/context.js";
-import { boardText } from "../core/tasks.js";
+import { renderBoard, renderRoster } from "./render.js";
 import { tenantCtx, listTenantIds } from "../core/tenancy.js";
 
 // A view key belongs to a team inside one tenant's database. In cloud mode we
@@ -39,13 +38,15 @@ export function boardRoutes(ctrl: Ctx): Hono {
     }
     const { c, code } = hit;
     const t = c.db.prepare("SELECT name FROM teams WHERE code=?").get(code) as { name: string } | undefined;
+    const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     const body = `
       <div class="board">
-        <div class="card"><h2>${icon("board", 16)} Task board</h2><pre>${esc(boardText(c, code))}</pre></div>
-        <div class="card"><h2>${icon("teams", 16)} Roster</h2><pre>${esc(rosterText(c, code))}</pre></div>
-        <p class="hint" style="text-align:center">Read-only view · refreshes every ${c.cfg.team.board_refresh_s}s</p>
+        <h1 style="text-align:center">${esc(t?.name || "Team board")}</h1>
+        <p class="hint" style="text-align:center;margin:0 0 18px">Read-only · as of <span data-live="stamp">${esc(stamp)}</span></p>
+        <div class="card"><h2>${icon("board", 16)} Task board</h2><div data-live="board">${renderBoard(c, code, { readOnly: true })}</div></div>
+        <div class="card"><h2>${icon("teams", 16)} Roster</h2><div data-live="roster">${renderRoster(c, code)}</div></div>
       </div>
-      <script>setTimeout(function(){location.reload();}, ${c.cfg.team.board_refresh_s * 1000});</script>`;
+      ${liveRefreshScript(c.cfg.team.board_refresh_s)}`;
     // A wide, chrome-free reading surface — no nav, nothing to click.
     return ctx.html(authPage(t?.name || "Board", `<style>.authwrap .card{max-width:none}.authwrap{justify-content:flex-start;padding-top:34px}.board{width:100%;max-width:820px}</style>${body}`));
   });

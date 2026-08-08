@@ -26,7 +26,7 @@ export function themeCss(): string {
   /* cool neutrals on pure white */
   --paper:#ffffff; --paper-2:#f6f8fb; --paper-3:#eef1f6;
   --ink:#0f172a; --ink-2:#48506a; --ink-3:#8a92a6;
-  --rule:#e6e9f0; --rule-2:#eff2f7;
+  --rule:#d8dde7; --rule-2:#e8ecf3;
   --good:#0f9d6b; --good-bg:#e7f6ef; --warn:#b4740c; --warn-bg:#fdf1de; --bad:#dc2b3e; --bad-bg:#fdeaec;
   --cast:0 1px 2px rgba(15,23,42,.05),0 4px 12px rgba(15,23,42,.06);
   --cast-2:0 2px 6px rgba(15,23,42,.08),0 18px 44px rgba(15,23,42,.12);
@@ -37,7 +37,10 @@ export function themeCss(): string {
 :root[data-theme="dark"], :root:not([data-theme="light"]){}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
   --paper:#0e1118; --paper-2:#161b25; --paper-3:#1e2430;
-  --ink:#e8ecf4; --ink-2:#a3abbd; --ink-3:#727a8c; --rule:#262d3a; --rule-2:#1c222d;
+  --ink:#e8ecf4; --ink-2:#a3abbd; --ink-3:#727a8c; --rule:#39414f; --rule-2:#242b37;
+  /* on dark, the accent must lighten — darkening it (the light-mode recipe)
+     drops links and the active nav item to ~2.2:1 */
+  --accent-strong:color-mix(in srgb,var(--accent) 45%,#fff);
   --accent-bg:color-mix(in srgb,var(--accent) 22%,#0e1118);
   --accent-line:color-mix(in srgb,var(--accent) 45%,#0e1118);
   --good-bg:color-mix(in srgb,var(--good) 20%,#0e1118); --warn-bg:color-mix(in srgb,var(--warn) 20%,#0e1118); --bad-bg:color-mix(in srgb,var(--bad) 20%,#0e1118);
@@ -45,7 +48,8 @@ export function themeCss(): string {
 }}
 :root[data-theme="dark"]{
   --paper:#0e1118; --paper-2:#161b25; --paper-3:#1e2430;
-  --ink:#e8ecf4; --ink-2:#a3abbd; --ink-3:#727a8c; --rule:#262d3a; --rule-2:#1c222d;
+  --ink:#e8ecf4; --ink-2:#a3abbd; --ink-3:#727a8c; --rule:#39414f; --rule-2:#242b37;
+  --accent-strong:color-mix(in srgb,var(--accent) 45%,#fff);
   --accent-bg:color-mix(in srgb,var(--accent) 22%,#0e1118);
   --accent-line:color-mix(in srgb,var(--accent) 45%,#0e1118);
   --good-bg:color-mix(in srgb,var(--good) 20%,#0e1118); --warn-bg:color-mix(in srgb,var(--warn) 20%,#0e1118); --bad-bg:color-mix(in srgb,var(--bad) 20%,#0e1118);
@@ -55,6 +59,12 @@ export function themeCss(): string {
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
 a{color:var(--accent-strong);text-decoration:none} a:hover{text-decoration:underline}
+/* one focus treatment for everything that can take focus — never the UA default */
+:where(a,button,summary,[tabindex],.iconbtn,.copy,.sw):focus-visible{outline:0;border-radius:7px;
+  box-shadow:0 0 0 3px var(--ring),0 0 0 1px var(--accent)}
+.fontpick input:focus-visible + .fs{border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+:disabled,[aria-disabled="true"]{opacity:.5;cursor:not-allowed;filter:grayscale(.3)}
+.btn:disabled:hover{filter:grayscale(.3)}
 .muted{color:var(--ink-3)} .small{font-size:13px}
 h1{font-family:var(--display);font-size:23px;letter-spacing:-.015em;margin:0 0 4px}
 h2{font-family:var(--display);font-size:15px;margin:0 0 12px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
@@ -87,14 +97,25 @@ input::placeholder{color:var(--ink-3)}
 .btn.sm{padding:7px 11px;font-size:13px;border-radius:8px}
 .btn.block{width:100%}
 
-.chip{display:inline-flex;align-items:center;gap:5px;font:600 11px/1 var(--mono);letter-spacing:.02em;padding:4px 9px;border-radius:var(--r-chip)}
+.chip{display:inline-flex;align-items:center;gap:5px;font:600 11px/1 var(--mono);letter-spacing:.02em;padding:4px 9px;border-radius:var(--r-chip);
+  background:var(--paper-3);color:var(--ink-2)}
 .chip.on{background:var(--accent-bg);color:var(--accent-strong)}
 .chip.good{background:var(--good-bg);color:var(--good)} .chip.warn{background:var(--warn-bg);color:var(--warn)} .chip.bad{background:var(--bad-bg);color:var(--bad)}
 
 .card{background:var(--paper);border:1px solid var(--rule);border-radius:var(--r);box-shadow:var(--cast);padding:20px 22px;margin:0 0 16px;animation:rise var(--slow) var(--ease) both}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap} .grow{flex:1}
 .sep{height:1px;background:var(--rule);margin:16px 0}
-.stat{flex:1;min-width:140px;text-align:center;padding:18px} .stat b{font:700 30px/1 var(--mono);letter-spacing:-.02em;display:block;margin-bottom:6px}
+/* stats keep an equal grid at every width (they used to orphan one card) */
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:16px}
+.stat{text-align:center;padding:18px;margin:0} .stat b{font:700 30px/1 var(--mono);letter-spacing:-.02em;display:block;margin:6px 0}
+/* disclosure: a real affordance, since the marker is suppressed */
+details>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px}
+details>summary::-webkit-details-marker{display:none}
+details>summary .chev{margin-left:auto;color:var(--ink-3);transition:transform var(--mid) var(--ease)}
+details[open]>summary .chev{transform:rotate(90deg)}
+/* board + roster rendered as data */
+.board-t td{vertical-align:top} .board-t .num{font:600 12px/1.9 var(--mono);color:var(--ink-3);width:52px}
+.board-t .ttitle{font-weight:600}
 
 table{width:100%;border-collapse:collapse;font-size:14px}
 th{text-align:left;font:600 11px/1 var(--sans);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);padding:0 12px 10px 0;border-bottom:1px solid var(--rule)}
@@ -127,8 +148,13 @@ pre{font:12.5px/1.55 var(--mono);background:var(--paper-2);border:1px solid var(
 .nav a.on::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:var(--accent)}
 .side .foot{margin-top:auto;display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--rule)}
 .who{font-size:12.5px;color:var(--ink-2);padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.iconbtn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:8px;border:1px solid var(--rule);background:var(--paper);color:var(--ink-2);cursor:pointer;transition:background var(--fast),color var(--fast),transform var(--fast) var(--spring)}
+.iconbtn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;flex:0 0 auto;border-radius:8px;border:1px solid var(--rule);background:var(--paper);color:var(--ink-2);cursor:pointer;transition:background var(--fast),color var(--fast),transform var(--fast) var(--spring)}
 .iconbtn:hover{background:var(--paper-3);color:var(--ink)} .iconbtn:active{transform:scale(.94)}
+/* sign out is a labelled control, not a mystery box shaped like an input */
+.signout{display:flex;align-items:center;justify-content:center;gap:8px;flex:1;height:34px;padding:0 12px;border-radius:8px;
+  border:1px solid var(--rule);background:var(--paper);color:var(--ink-2);font:600 13px/1 var(--sans);cursor:pointer;
+  transition:background var(--fast),color var(--fast)}
+.signout:hover{background:var(--paper-3);color:var(--ink);text-decoration:none}
 .main{min-width:0;display:flex;flex-direction:column}
 .topbar{display:flex;align-items:center;gap:12px;padding:14px 30px;border-bottom:1px solid var(--rule);position:sticky;top:0;background:color-mix(in srgb,var(--paper) 86%,transparent);backdrop-filter:saturate(1.4) blur(8px);z-index:5}
 /* the sidebar already says where you are — the page title is a quiet label */
@@ -153,6 +179,12 @@ pre{font:12.5px/1.55 var(--mono);background:var(--paper-2);border:1px solid var(
 .fontpick .fs b{display:block;font-size:17px;line-height:1.25;margin-bottom:4px;color:var(--ink)}
 .fontpick .fs .note{display:block;font-size:11.5px;line-height:1.45;color:var(--ink-3)}
 
+/* the theme button shows the glyph for what the click will DO */
+.ico-dark{display:none}
+:root[data-theme="dark"] .ico-light{display:none} :root[data-theme="dark"] .ico-dark{display:inline-flex}
+:root[data-theme="light"] .ico-light{display:inline-flex} :root[data-theme="light"] .ico-dark{display:none}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .ico-light{display:none}
+  :root:not([data-theme="light"]) .ico-dark{display:inline-flex}}
 .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:11px 18px;border-radius:var(--r-sm);box-shadow:var(--cast-2);animation:toastIn var(--slow) var(--spring) both;font-size:14px;z-index:20}
 .danger-zone{border-color:color-mix(in srgb,var(--bad) 35%,var(--rule))}
 
@@ -218,6 +250,24 @@ var t=b.getAttribute('data-copy');var done=function(){var o=b.innerHTML;b.classL
 if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done,function(){});}
 else{var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(err){}document.body.removeChild(ta);}});</script>`;
 
+// Live refresh that cannot eat your work: it re-fetches the page and swaps only
+// the marked regions, and stands down entirely while anything is focused or a
+// field has been edited. (A full location.reload() used to discard typed input.)
+export const liveRefreshScript = (seconds: number) => `<script>(function(){
+var ms=${Math.max(3, seconds)}*1000, dirty=false;
+document.addEventListener('input',function(e){if(e.target.closest('form'))dirty=true;});
+function busy(){var a=document.activeElement;
+  return dirty|| (a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))|| !!document.querySelector('details[open] form');}
+async function tick(){
+  if(document.hidden||busy())return;
+  try{var r=await fetch(location.href,{headers:{'x-live':'1'}});if(!r.ok)return;
+    var doc=new DOMParser().parseFromString(await r.text(),'text/html');
+    document.querySelectorAll('[data-live]').forEach(function(el){
+      var next=doc.querySelector('[data-live="'+el.getAttribute('data-live')+'"]');
+      if(next&&next.innerHTML!==el.innerHTML)el.innerHTML=next.innerHTML;});
+  }catch(e){}}
+setInterval(tick,ms);})();</script>`;
+
 export interface Nav { href: string; label: string; icon: string; active?: boolean }
 
 // Sidebar shell for signed-in pages.
@@ -227,11 +277,13 @@ export function appShell(opts: {
   const nav = opts.nav.map((n) =>
     `<a class="${n.active ? "on" : ""}" href="${esc(n.href)}">${icon(n.icon, 18)}<span>${esc(n.label)}</span></a>`).join("");
   const toast = opts.toast ? `<div class="toast">${esc(opts.toast)}</div>` : "";
-  const themeBtn = `<button class="iconbtn" type="button" onclick="__toggleTheme()" title="Toggle theme" aria-label="Toggle theme">${icon("sun", 17)}</button>`;
+  // one control, both glyphs — the script shows whichever the click will produce
+  const themeBtn = `<button class="iconbtn" type="button" onclick="__toggleTheme()" title="Switch light / dark" aria-label="Switch light / dark">` +
+    `<span class="ico-light">${icon("moon", 17)}</span><span class="ico-dark">${icon("sun", 17)}</span></button>`;
   const foot = `<div class="foot">
-    <a class="repo" href="${REPO_URL}" target="_blank" rel="noopener">${icon("link", 15)}<span>Source on GitHub</span></a>
     ${opts.account ? `<div class="who" title="${esc(opts.account)}">${esc(opts.account)}</div>` : ""}
-    <div class="row" style="gap:8px">${themeBtn}<a class="iconbtn grow" href="/logout" title="Sign out" aria-label="Sign out" style="text-decoration:none">${icon("logout", 17)}</a></div></div>`;
+    <div class="row" style="gap:8px">${themeBtn}<a class="signout" href="/logout">${icon("logout", 16)}<span>Sign out</span></a></div>
+    <a class="repo" href="${REPO_URL}" target="_blank" rel="noopener">${icon("link", 15)}<span>Source on GitHub</span></a></div>`;
   return `${head(opts.title)}
 <body><div class="app">
 <aside class="side">
@@ -240,7 +292,7 @@ export function appShell(opts: {
   ${foot}
 </aside>
 <main class="main">
-  <header class="topbar"><p class="ttl grow">${esc(opts.title)}</p>${opts.actions || ""}</header>
+  ${opts.actions ? `<header class="topbar">${opts.actions}</header>` : ""}
   <div class="content">${opts.body}</div>
 </main>
 </div>${toast}${copyScript}</body></html>`;

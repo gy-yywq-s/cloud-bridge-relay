@@ -76,26 +76,30 @@ export function authRoutes(c: Ctx): Hono {
     `<a ${id ? `id="${id}" ` : ""}class="btn gh block" href="/auth/github${qs(authPid, state)}">${githubMark(17)}Continue with GitHub</a>`;
 
   // ── Sign in ───────────────────────────────────────────────────────────────
+  // The sign-in card, rendered with an optional inline error and the email the
+  // human already typed — a failed attempt must never blank the form.
+  const loginCard = (authPid: string, state: string, err = "", email = "") => authPage(authPid ? "Authorize a client" : "Sign in", `
+      <div class="card">
+        <h1>Sign in</h1>
+        ${authPid ? `<p class="muted small">An MCP client wants to connect to your ${esc(c.cfg.brand.name)} account.</p>` : `<p class="muted small">Welcome back.</p>`}
+        ${err ? `<p class="err" role="alert">${esc(err)}</p>` : ""}
+        <form method="post" action="/login">${hiddenFields(authPid, state)}
+          <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="email" required autofocus value="${esc(email)}">
+          <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+          <button class="btn" style="margin-top:16px">Sign in</button>
+        </form>
+        ${gh ? `<div class="sep"></div>${ghAnchor(authPid, state)}` : ""}
+        ${deployerPassword(c) ? `<p class="small muted" style="margin-top:12px">Deployer? Enter the deployer password as the password with any email.</p>` : ""}
+        ${openReg ? `<p class="altlink">New here? <a href="/signup${qs(authPid, state)}">Create an account</a></p>` : ""}
+      </div>`);
+
   app.get("/login", async (ctx) => {
     const authPid = ctx.req.query("auth") || "";
     const state = ctx.req.query("state") || "";
     const sess = await getSession(c, ctx);
     if (sess != null && authPid) return ctx.html(consentPage(c, ctx, authPid, state)); // approve waiting client
     if (sess != null) return ctx.redirect("/app");
-    const dep = deployerPassword(c) ? `<p class="small muted" style="margin-top:12px">Deployer? Enter the deployer password as the password with any email.</p>` : "";
-    return ctx.html(authPage(authPid ? "Authorize a client" : "Sign in", `
-      <div class="card">
-        <h1>Sign in</h1>
-        ${authPid ? `<p class="muted small">An MCP client wants to connect to your ${esc(c.cfg.brand.name)} account.</p>` : `<p class="muted small">Welcome back.</p>`}
-        <form method="post" action="/login">${hiddenFields(authPid, state)}
-          <label>Email</label><input name="email" type="email" required autofocus>
-          <label>Password</label><input name="password" type="password" required>
-          <button class="btn" style="margin-top:16px">Sign in</button>
-        </form>
-        ${gh ? `<div class="sep"></div>${ghAnchor(authPid, state)}` : ""}
-        ${dep}
-        ${openReg ? `<p class="altlink">New here? <a href="/signup${qs(authPid, state)}">Create an account</a></p>` : ""}
-      </div>`));
+    return ctx.html(loginCard(authPid, state));
   });
 
   app.post("/login", async (ctx) => {
@@ -105,32 +109,39 @@ export function authRoutes(c: Ctx): Hono {
     const dep = deployerPassword(c);
     if (dep && password === dep) return afterAuth(c, ctx, -1, authPid, state); // deployer (private only)
     const id = await verifyAccount(c, email, password);
-    if (id == null) return ctx.html(errPage(c, "Sign in", "Wrong email or password.", `/login${qs(authPid, state)}`), 401);
+    if (id == null) return ctx.html(loginCard(authPid, state, "Wrong email or password.", email), 401);
     return afterAuth(c, ctx, id, authPid, state);
   });
 
   // ── Create account (separate page) ─────────────────────────────────────────
+  // Same contract as the sign-in card: errors render inline and every value the
+  // human already typed comes back with them.
+  const signupCard = (authPid: string, state: string, err = "", invite = "", email = "") => {
+    const ghBlock = gh ? `<div class="sep"></div>${ghAnchor(authPid, state, "ghlink")}
+      <p class="small muted" style="margin-top:8px">GitHub sign-up uses the invite code above too.</p>
+      <script>(function(){var g=document.getElementById('ghlink'),f=document.getElementById('invitefield');if(g&&f)g.addEventListener('click',function(){var u=new URL(g.getAttribute('href'),location.origin);if(f.value)u.searchParams.set('invite',f.value.trim());g.setAttribute('href',u.pathname+u.search);});})();</script>` : "";
+    return authPage("Create account", `
+      <div class="card">
+        <h1>Create your account</h1>
+        <p class="muted small">Registration is invite-only — enter your code to join.</p>
+        ${err ? `<p class="err" role="alert">${esc(err)}</p>` : ""}
+        <form method="post" action="/signup">${hiddenFields(authPid, state)}
+          <label for="invitefield">Invite code</label><input id="invitefield" name="invite" placeholder="crew-XXXX-XXXX" autocomplete="off" required autofocus value="${esc(invite)}">
+          <label for="su-email">Email</label><input id="su-email" name="email" type="email" autocomplete="email" required value="${esc(email)}">
+          <label for="su-pw">Password (min 8)</label><input id="su-pw" name="password" type="password" autocomplete="new-password" minlength="8" required>
+          <button class="btn" style="margin-top:16px">Create account</button>
+        </form>
+        ${ghBlock}
+        <p class="altlink">Already have an account? <a href="/login${qs(authPid, state)}">Sign in</a></p>
+      </div>`);
+  };
+
   app.get("/signup", async (ctx) => {
     if (!openReg) return ctx.redirect("/login");
     const authPid = ctx.req.query("auth") || "";
     const state = ctx.req.query("state") || "";
     if ((await getSession(c, ctx)) != null) return ctx.redirect(authPid ? `/login${qs(authPid, state)}` : "/app");
-    const ghBlock = gh ? `<div class="sep"></div>${ghAnchor(authPid, state, "ghlink")}
-      <p class="small muted" style="margin-top:8px">GitHub sign-up uses the invite code above too.</p>
-      <script>(function(){var g=document.getElementById('ghlink'),f=document.getElementById('invitefield');if(g&&f)g.addEventListener('click',function(){var u=new URL(g.getAttribute('href'),location.origin);if(f.value)u.searchParams.set('invite',f.value.trim());g.setAttribute('href',u.pathname+u.search);});})();</script>` : "";
-    return ctx.html(authPage("Create account", `
-      <div class="card">
-        <h1>Create your account</h1>
-        <p class="muted small">Registration is invite-only — enter your code to join.</p>
-        <form method="post" action="/signup">${hiddenFields(authPid, state)}
-          <label>Invite code</label><input name="invite" id="invitefield" placeholder="crew-XXXX-XXXX" required autofocus>
-          <label>Email</label><input name="email" type="email" required>
-          <label>Password (min 8)</label><input name="password" type="password" required>
-          <button class="btn" style="margin-top:16px">Create account</button>
-        </form>
-        ${ghBlock}
-        <p class="altlink">Already have an account? <a href="/login${qs(authPid, state)}">Sign in</a></p>
-      </div>`));
+    return ctx.html(signupCard(authPid, state));
   });
 
   app.post("/signup", async (ctx) => {
@@ -143,12 +154,13 @@ export function authRoutes(c: Ctx): Hono {
     // needs a valid one, consumed atomically after the account is created.
     // Admin is NOT granted from this self-asserted email — only proven ones.
     const bypass = isAdminEmail(c, email);
-    if (!bypass && !inviteValid(c, invite)) return ctx.html(errPage(c, "Create account", "That invite code is invalid, expired, or already used.", `/signup${qs(authPid, state)}`), 400);
+    const fail = (msg: string) => ctx.html(signupCard(authPid, state, msg, invite, email), 400);
+    if (!bypass && !inviteValid(c, invite)) return fail("That invite code is invalid, expired, or already used.");
     const r = await createAccount(c, email, String(b.password || ""));
-    if ("error" in r) return ctx.html(errPage(c, "Create account", r.error, `/signup${qs(authPid, state)}`), 400);
+    if ("error" in r) return fail(r.error);
     if (!bypass && !consumeInvite(c, invite)) {
       c.db.prepare("DELETE FROM accounts WHERE id=?").run(r.id);
-      return ctx.html(errPage(c, "Create account", "That invite was just used up. Ask for another.", `/signup${qs(authPid, state)}`), 400);
+      return fail("That invite was just used up. Ask for another.");
     }
     return afterAuth(c, ctx, r.id, authPid, state);
   });

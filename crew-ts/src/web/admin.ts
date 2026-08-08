@@ -87,7 +87,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
     }).join("") || `<tr><td colspan="5" class="empty">No invite codes yet — generate one to let someone register.</td></tr>`;
 
     const body = `
-      <div class="row" style="gap:14px;margin-bottom:18px">
+      <div class="stats">
         <div class="card stat">${icon("user", 20)}<b>${accounts.length}</b><span class="muted small">accounts</span></div>
         <div class="card stat">${icon("activity", 20)}<b>${activeUsers}</b><span class="muted small">active · 24h</span></div>
         <div class="card stat">${icon("invite", 20)}<b>${live}</b><span class="muted small">live invites</span></div>
@@ -96,7 +96,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
         <form method="post" action="/admin/invite" class="row" style="align-items:flex-end">
           <div><label style="margin-top:0">Uses (0 = ∞)</label><input name="max_uses" type="number" value="1" min="0" style="width:104px"></div>
           <div><label style="margin-top:0">Expires (days)</label><input name="expires_days" type="number" min="1" placeholder="never" style="width:130px"></div>
-          <div class="grow"><label style="margin-top:0">Note</label><input name="note" placeholder="who / why"></div>
+          <div class="grow"><label style="margin-top:0">Name</label><input name="note" placeholder="who it is for"></div>
           <button class="btn">${icon("plus", 15)}Generate</button>
         </form>
         <form method="post" action="/admin/invite/toggle"><table style="margin-top:14px"><thead><tr><th>Code</th><th>Name</th><th>Uses</th><th>State</th><th></th></tr></thead><tbody>${invRows}</tbody></table></form>
@@ -104,7 +104,8 @@ export function adminRoutes(ctrl: Ctx): Hono {
       <div class="card"><h2>${icon("activity", 16)} Users &amp; activity</h2>
         <p class="hint" style="margin:0 0 12px">Aggregate counts only — message and task content stays inside each user's isolated database and is never shown here.</p>
         <table><thead><tr><th>Account</th><th>Teams</th><th>Agents</th><th>Messages</th><th>Last active</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    return ctx.html(appShell({ title: "Admin", nav: navFor("admin", true), body, account: accountEmail(ctrl, me) }));
+    const toast = ctx.req.query("saved") === "invite" ? "Invite code generated." : ctx.req.query("saved") === "removed" ? "Invite code deleted." : ctx.req.query("saved") === "user" ? "Account deleted." : "";
+    return ctx.html(appShell({ title: "Admin", nav: navFor("admin", true), body, account: accountEmail(ctrl, me), toast }));
   });
 
   app.post("/admin/invite", async (ctx) => {
@@ -112,7 +113,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
     if (me == null) return ctx.redirect("/app");
     const b = await ctx.req.parseBody();
     createInvite(ctrl, me, { note: String(b.note || ""), max_uses: Number(b.max_uses) || 1, expires_days: Number(b.expires_days) || 0 });
-    return ctx.redirect("/admin");
+    return ctx.redirect("/admin?saved=invite");
   });
   app.post("/admin/invite/toggle", async (ctx) => {
     if ((await guard(ctx)) == null) return ctx.redirect("/app");
@@ -120,7 +121,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
     if (b.disable) setInviteDisabled(ctrl, String(b.disable), true);
     if (b.enable) setInviteDisabled(ctrl, String(b.enable), false);
     if (b.remove) deleteInvite(ctrl, String(b.remove));
-    return ctx.redirect("/admin");
+    return ctx.redirect(b.remove ? "/admin?saved=removed" : "/admin");
   });
   app.post("/admin/user/delete", async (ctx) => {
     const me = await guard(ctx);
@@ -128,7 +129,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
     const b = await ctx.req.parseBody();
     const id = Number(b.id);
     if (id && id !== me) deleteAccount(ctrl, id); // never delete self from here
-    return ctx.redirect("/admin");
+    return ctx.redirect("/admin?saved=user");
   });
 
   return app;
