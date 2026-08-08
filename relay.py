@@ -929,13 +929,15 @@ USAGE = {
             "server:cloud-manager` and accept the two consent dialogs. Team/"
             "Enterprise orgs must have channels enabled by an admin."),
         "mode_2_push_codex": (
-            "Codex has no channels, but its app-server (JSON-RPC over stdio/"
-            "WebSocket) exposes turn/steer — inject user input into an "
-            "in-flight turn — and thread/inject_items. Recipe: run codex via "
-            "app-server, plus a sidecar that loops GET /checkmail?box=X&"
-            "wait=50 and forwards each message as turn/steer (ack after the "
-            "steer succeeds). No official sidecar shipped here yet; polling "
-            "mode_1 is the supported default for codex workers."),
+            "Codex has no channels, but its app-server exposes turn/steer "
+            "(inject user input into an in-flight turn). A ready sidecar "
+            "ships in the cloud-bridge-relay repo at codex/sidecar.py: it "
+            "spawns `codex app-server`, starts/resumes a thread, long-polls "
+            "/checkmail, delivers each message via turn/steer when a turn is "
+            "in flight or turn/start when idle, and acks only after codex "
+            "accepted the input. Run: RELAY_URL=... RELAY_TOKEN=... "
+            "RELAY_BOX=... RELAY_POOL=... python3 codex/sidecar.py "
+            "(stdlib only; CODEX_THREAD resumes an existing thread)."),
     },
     "endpoints": {
         "GET /": "this document",
