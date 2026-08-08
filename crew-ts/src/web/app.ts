@@ -62,7 +62,24 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
       return `<tr><td>${esc(b.session_name || b.box)}<div class="small muted">${esc(b.box)}</div></td><td>${esc(kind)}</td><td>${esc(b.role || "-")}</td><td>${esc(b.team_code || "-")}</td><td>${st}</td></tr>`;
     }).join("") || `<tr><td colspan="5" class="empty">No sessions yet. Connect one from Claude Code, Codex, or claude.ai.</td></tr>`;
 
-    const body = `
+    // How to connect — the web half of the plugin's job. Prominent while the
+    // crew is empty, collapsed once sessions exist.
+    const mcpUrl = `${c.cfg.public_url || `http://${c.cfg.host}:${c.cfg.port}`}/mcp`;
+    const empty = boxes.length === 0;
+    const connect = `
+      <details class="card"${empty ? " open" : ""}>
+        <summary style="cursor:pointer;list-style:none"><h2 style="margin:0">${icon("link", 16)} Connect a session${empty ? "" : ` <span class="muted small" style="font-weight:400">— MCP URL and commands</span>`}</h2></summary>
+        <p class="hint" style="margin:10px 0">Point Claude Code, Codex or claude.ai at this relay, then run <code>/crew:onboard &lt;pool&gt;</code> in each session. The first connection opens a browser to sign in.</p>
+        <div class="row"><code class="grow" style="overflow-x:auto">${esc(mcpUrl)}</code>
+          <button type="button" class="copy" data-copy="${esc(mcpUrl)}">${icon("copy", 13)}copy</button></div>
+        <div class="row" style="margin-top:12px;gap:8px">
+          <button type="button" class="copy" data-copy="/plugin marketplace add gy-yywq-s/cloud-bridge-relay">${icon("copy", 13)}plugin install</button>
+          <button type="button" class="copy" data-copy="/crew:onboard 1234">${icon("copy", 13)}/crew:onboard 1234</button>
+          <button type="button" class="copy" data-copy="/crew:setup 1234">${icon("copy", 13)}/crew:setup 1234</button>
+        </div>
+      </details>`;
+
+    const body = `${connect}
       <div class="row" style="gap:14px;margin-bottom:18px">
         <div class="card stat">${icon("teams", 20)}<b>${teams.length}</b><span class="muted small">teams</span></div>
         <div class="card stat">${icon("dashboard", 20)}<b>${agents}</b><span class="muted small">agents</span></div>

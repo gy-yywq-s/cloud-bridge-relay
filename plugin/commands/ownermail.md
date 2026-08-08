@@ -17,3 +17,8 @@ Set up the owner mailbox so the team can reach the human by email.
 
 Editing later: run this again. Same email = name/alias update only, no
 re-verification. A new email restarts verification.
+
+The owner can also do all of this in a browser — the relay's Settings page
+(`<relay base>/settings`) has the same fields (name, alias, email, contact mode,
+custom rules). If they would rather click than dictate, send them there; the two
+write the same record.

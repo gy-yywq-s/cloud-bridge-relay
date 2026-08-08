@@ -22,3 +22,10 @@ Explain and, if asked, change how this session hears from the team.
      command from the tool response; do not pretend it can be enabled here.
 4. Never claim mail will be pushed to you when nothing is running. If the tool
    says the watcher is probably dead, say so plainly and offer to restart it.
+
+The two push-delivery mechanisms ship with this plugin:
+- Claude Code: the Stop-hook watcher at `${CLAUDE_PLUGIN_ROOT}/scripts/crew-watch.sh`
+  (inert until `CREW_TOKEN` and `CREW_BOX` are set).
+- Codex: the sidecar at `${CLAUDE_PLUGIN_ROOT}/scripts/codex-sidecar.py`, which
+  wraps `codex app-server` and injects mail into the running turn.
+Run `/crew:selfhost sidecar` for the setup steps.
