@@ -16,7 +16,9 @@ import { authRoutes } from "./auth/web.js";
 import { dashboardRoutes } from "./web/app.js";
 import { adminRoutes } from "./web/admin.js";
 import { settingsRoutes } from "./web/settings.js";
+import { boardRoutes } from "./web/board.js";
 import { loadBrand } from "./web/brand.js";
+import { applyConfigOverrides } from "./web/config-store.js";
 import { reconcileAdmins } from "./auth/accounts.js";
 import { loadConfig } from "./config.js";
 import { openDb } from "./db.js";
@@ -40,6 +42,7 @@ const db = openDb(cfg);
 const ctrl: Ctx = { db, cfg, email: makeEmail(cfg) };
 reconcileAdmins(ctrl);
 loadBrand(ctrl);
+applyConfigOverrides(ctrl); // web-edited tunables win over crew.toml
 startSweeps(ctrl, () => (cfg.mode === "cloud" ? listTenantIds(ctrl).map((id) => tenantCtx(ctrl, id)) : [ctrl]));
 
 // A rejected promise or thrown timer must never take the relay down.
@@ -151,6 +154,7 @@ app.get("/api/viewkey", (c) => { const code = resolveViewKey(T(c), c.req.query("
 
 app.route("/", dashboardRoutes(ctrl));
 app.route("/", settingsRoutes(ctrl));
+app.route("/", boardRoutes(ctrl)); // public read-only board by view key (/b/<key>)
 if (cfg.mode === "cloud") app.route("/", adminRoutes(ctrl));
 
 const host = cfg.host;

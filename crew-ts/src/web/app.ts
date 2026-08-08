@@ -6,7 +6,7 @@ import type { Ctx } from "../core/context.js";
 import { appShell, esc } from "./theme.js";
 import { icon } from "./icons.js";
 import { navFor } from "./nav.js";
-import { rosterText } from "../core/context.js";
+import { rosterText, teamViewKey } from "../core/context.js";
 import { doPool, doInitializeTeam, doSetTeamName, doSetBoxRole, fullMembers } from "../core/teams.js";
 import { boardText } from "../core/tasks.js";
 import { wizPending } from "../core/wizard.js";
@@ -86,6 +86,9 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
        <td>${["manager", "worker"].map((r) => `<button class="btn sm ${m.role === r ? "" : "ghost"}" formaction="/app/team/${esc(code)}/role" name="set" value="${m.member_no}:${r}">${r}</button>`).join(" ")}</td>
        <td>${m.pending_mail ? `<span class="chip">${m.pending_mail} unread</span>` : ""}${m.stale ? `<span class="chip bad">stale</span>` : ""}</td></tr>`).join("");
     const t = c.db.prepare("SELECT name FROM teams WHERE code=?").get(code) as { name: string };
+    const key = teamViewKey(c, code);
+    const base = c.cfg.public_url || `http://${c.cfg.host}:${c.cfg.port}`;
+    const shareUrl = `${base}/b/${key || ""}`;
     const body = `
       <p class="crumb"><a href="/app">Dashboard</a> ${icon("chevron", 13)} ${esc(t.name || code)}</p>
       <div class="card"><h2>${icon("settings", 16)} Team name</h2>
@@ -97,6 +100,11 @@ export function dashboardRoutes(ctrl: Ctx): Hono {
         <p class="hint">Workers can never mail the owner; that is enforced server-side.</p></div>
       <div class="card"><h2>${icon("board", 16)} Task board</h2><pre id="board">${esc(boardText(c, code))}</pre></div>
       <div class="card"><h2>${icon("user", 16)} Roster</h2><pre>${esc(rosterText(c, code))}</pre></div>
+      <div class="card"><h2>${icon("link", 16)} Share this board</h2>
+        <p class="hint" style="margin:0 0 10px">A read-only link to this team's board and roster — no account needed. Safe to give someone who should watch progress.</p>
+        <div class="row"><code class="grow" style="overflow-x:auto">${esc(shareUrl)}</code>
+          <button type="button" class="copy" data-copy="${esc(shareUrl)}">${icon("copy", 13)}copy</button>
+          <a class="btn sm ghost" href="/b/${esc(key || "")}" target="_blank" rel="noopener">open</a></div></div>
       <script>setTimeout(()=>location.reload(), ${c.cfg.team.board_refresh_s * 1000});</script>`;
     return ctx.html(H(id, "app", t.name || "Team", body));
   });

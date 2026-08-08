@@ -19,10 +19,17 @@ export function isAdminEmail(c: Ctx, email: string): boolean {
   return (c.cfg.auth.admin_emails || []).map((e) => e.trim().toLowerCase()).includes(email.trim().toLowerCase());
 }
 
+// Admin iff the stored flag is set OR the account's email is on the configured
+// allow-list. Checking the allow-list here (not only at startup) makes the answer
+// stable across restarts, config edits, and accounts created later — the flaky
+// "sometimes I'm not admin" case. A match also heals the stored flag.
 export function isAdmin(c: Ctx, accountId: number | null | undefined): boolean {
-  if (accountId == null) return false;
-  const r = c.db.prepare("SELECT is_admin FROM accounts WHERE id=?").get(accountId) as { is_admin: number } | undefined;
-  return !!r?.is_admin;
+  if (accountId == null || accountId < 1) return false;
+  const r = c.db.prepare("SELECT is_admin, email FROM accounts WHERE id=?").get(accountId) as { is_admin: number; email: string } | undefined;
+  if (!r) return false;
+  if (r.is_admin) return true;
+  if (isAdminEmail(c, r.email)) { c.db.prepare("UPDATE accounts SET is_admin=1 WHERE id=?").run(accountId); return true; }
+  return false;
 }
 
 // Promote existing accounts whose email is on the admin list — but ONLY GitHub

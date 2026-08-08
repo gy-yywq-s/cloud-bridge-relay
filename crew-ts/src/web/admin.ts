@@ -7,7 +7,7 @@ import { appShell, esc } from "./theme.js";
 import { icon } from "./icons.js";
 import { navFor } from "./nav.js";
 import { getSession, isAdmin, deleteAccount } from "../auth/accounts.js";
-import { createInvite, listInvites, setInviteDisabled } from "../auth/invites.js";
+import { createInvite, listInvites, setInviteDisabled, deleteInvite } from "../auth/invites.js";
 import { tenantDb } from "../core/tenancy.js";
 import { accountEmail } from "./app.js";
 
@@ -75,10 +75,16 @@ export function adminRoutes(ctrl: Ctx): Hono {
       const act = i.disabled
         ? `<button class="btn sm ghost" name="enable" value="${esc(i.code)}">enable</button>`
         : `<button class="btn sm ghost" name="disable" value="${esc(i.code)}">disable</button>`;
-      return `<tr><td><code>${esc(i.code)}</code>${i.note ? `<div class="small muted">${esc(i.note)}</div>` : ""}</td>
+      return `<tr>
+        <td><span class="row" style="gap:8px;flex-wrap:nowrap"><code>${esc(i.code)}</code>
+          <button type="button" class="copy" data-copy="${esc(i.code)}" title="Copy code">${icon("copy", 13)}copy</button></span></td>
+        <td class="muted">${i.note ? esc(i.note) : "—"}</td>
         <td>${i.uses}/${i.max_uses === 0 ? "∞" : i.max_uses}</td>
-        <td>${state}</td><td style="text-align:right">${act}</td></tr>`;
-    }).join("") || `<tr><td colspan="4" class="empty">No invite codes yet — generate one to let someone register.</td></tr>`;
+        <td>${state}</td>
+        <td style="text-align:right"><span class="row" style="gap:6px;justify-content:flex-end;flex-wrap:nowrap">${act}
+          <button class="iconbtn" name="remove" value="${esc(i.code)}" title="Delete code"
+            onclick="return confirm('Delete invite code ${esc(i.code)}? Anyone holding it can no longer register.')">${icon("trash", 15)}</button></span></td></tr>`;
+    }).join("") || `<tr><td colspan="5" class="empty">No invite codes yet — generate one to let someone register.</td></tr>`;
 
     const body = `
       <div class="row" style="gap:14px;margin-bottom:18px">
@@ -93,7 +99,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
           <div class="grow"><label style="margin-top:0">Note</label><input name="note" placeholder="who / why"></div>
           <button class="btn">${icon("plus", 15)}Generate</button>
         </form>
-        <form method="post" action="/admin/invite/toggle"><table style="margin-top:14px"><thead><tr><th>Code</th><th>Uses</th><th>State</th><th></th></tr></thead><tbody>${invRows}</tbody></table></form>
+        <form method="post" action="/admin/invite/toggle"><table style="margin-top:14px"><thead><tr><th>Code</th><th>Name</th><th>Uses</th><th>State</th><th></th></tr></thead><tbody>${invRows}</tbody></table></form>
       </div>
       <div class="card"><h2>${icon("activity", 16)} Users &amp; activity</h2>
         <p class="hint" style="margin:0 0 12px">Aggregate counts only — message and task content stays inside each user's isolated database and is never shown here.</p>
@@ -113,6 +119,7 @@ export function adminRoutes(ctrl: Ctx): Hono {
     const b = await ctx.req.parseBody();
     if (b.disable) setInviteDisabled(ctrl, String(b.disable), true);
     if (b.enable) setInviteDisabled(ctrl, String(b.enable), false);
+    if (b.remove) deleteInvite(ctrl, String(b.remove));
     return ctx.redirect("/admin");
   });
   app.post("/admin/user/delete", async (ctx) => {

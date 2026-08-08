@@ -6,15 +6,17 @@
 //  • A persistent sidebar shell for signed-in pages; a centered card shell for
 //    auth. Line icons, soft cool shadows, spring motion, light+dark, and a
 //    working theme toggle.
-import { getBrand } from "./brand.js";
+import { getBrand, fontSet, REPO_URL } from "./brand.js";
 import { icon } from "./icons.js";
 
 export function themeCss(): string {
-  const accent = getBrand().accent;
+  const { accent, font } = getBrand();
+  const f = fontSet(font);
   return `
 :root{
-  --sans: ui-sans-serif,-apple-system,"SF Pro Text","Segoe UI",Roboto,system-ui,sans-serif;
-  --mono: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --sans: ${f.sans};
+  --mono: ${f.mono};
+  --display: ${f.display || f.sans};
   /* ── swap --accent to rebrand (also settable in Settings) ── */
   --accent:${accent};
   --accent-strong:color-mix(in srgb,var(--accent) 82%,#000);
@@ -54,8 +56,10 @@ html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
 a{color:var(--accent-strong);text-decoration:none} a:hover{text-decoration:underline}
 .muted{color:var(--ink-3)} .small{font-size:13px}
-h1{font-size:23px;letter-spacing:-.015em;margin:0 0 4px} h2{font-size:15px;margin:0 0 12px;letter-spacing:-.01em}
+h1{font-family:var(--display);font-size:23px;letter-spacing:-.015em;margin:0 0 4px}
+h2{font-family:var(--display);font-size:15px;margin:0 0 12px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
 .ico{flex:0 0 auto;vertical-align:-.18em}
+code{font-family:var(--mono);font-size:13px}
 
 /* ── brand mark ── */
 .mark{width:26px;height:26px;display:inline-flex;flex:0 0 auto}
@@ -126,10 +130,28 @@ pre{font:12.5px/1.55 var(--mono);background:var(--paper-2);border:1px solid var(
 .iconbtn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:8px;border:1px solid var(--rule);background:var(--paper);color:var(--ink-2);cursor:pointer;transition:background var(--fast),color var(--fast),transform var(--fast) var(--spring)}
 .iconbtn:hover{background:var(--paper-3);color:var(--ink)} .iconbtn:active{transform:scale(.94)}
 .main{min-width:0;display:flex;flex-direction:column}
-.topbar{display:flex;align-items:center;gap:12px;padding:20px 30px;border-bottom:1px solid var(--rule);position:sticky;top:0;background:color-mix(in srgb,var(--paper) 86%,transparent);backdrop-filter:saturate(1.4) blur(8px);z-index:5}
-.topbar h1{margin:0} .content{padding:26px 30px 70px;max-width:1000px;width:100%}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 30px;border-bottom:1px solid var(--rule);position:sticky;top:0;background:color-mix(in srgb,var(--paper) 86%,transparent);backdrop-filter:saturate(1.4) blur(8px);z-index:5}
+/* the sidebar already says where you are — the page title is a quiet label */
+.topbar .ttl{margin:0;font:600 11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.1em;color:var(--ink-3)}
+/* content is centred in the main column, not flush left */
+.content{padding:26px 30px 70px;max-width:1040px;width:100%;margin:0 auto}
 .crumb{color:var(--ink-3);font-size:13px;margin:0 0 14px;display:inline-flex;align-items:center;gap:4px}
 .empty{color:var(--ink-3);padding:14px 0}
+.copy{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule);background:var(--paper-2);color:var(--ink-2);
+  border-radius:7px;padding:5px 9px;font:600 12px/1 var(--mono);cursor:pointer;transition:background var(--fast),color var(--fast),border-color var(--fast)}
+.copy:hover{background:var(--accent-bg);color:var(--accent-strong);border-color:var(--accent-line)}
+.copy.done{background:var(--good-bg);color:var(--good);border-color:transparent}
+.repo{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:8px;color:var(--ink-3);font-size:12.5px;transition:background var(--fast),color var(--fast)}
+.repo:hover{background:var(--paper-3);color:var(--ink-2);text-decoration:none}
+.fontpick{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:6px}
+.fontpick label{position:relative;display:block;margin:0;cursor:pointer;font-weight:400}
+.fontpick input{position:absolute;inset:0;opacity:0;pointer-events:none}
+.fontpick .fs{display:block;border:1px solid var(--rule);border-radius:var(--r-sm);padding:12px 13px;height:100%;
+  transition:border-color var(--fast),background var(--fast),box-shadow var(--fast)}
+.fontpick .fs:hover{background:var(--paper-2)}
+.fontpick input:checked + .fs{border-color:var(--accent);background:var(--accent-bg);box-shadow:0 0 0 3px var(--ring)}
+.fontpick .fs b{display:block;font-size:17px;line-height:1.25;margin-bottom:4px;color:var(--ink)}
+.fontpick .fs .note{display:block;font-size:11.5px;line-height:1.45;color:var(--ink-3)}
 
 .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:11px 18px;border-radius:var(--r-sm);box-shadow:var(--cast-2);animation:toastIn var(--slow) var(--spring) both;font-size:14px;z-index:20}
 .danger-zone{border-color:color-mix(in srgb,var(--bad) 35%,var(--rule))}
@@ -190,6 +212,12 @@ ${cardHtml}
 </div>${toast}</body></html>`;
 }
 
+// One-click copy for any element carrying data-copy.
+const copyScript = `<script>document.addEventListener('click',function(e){var b=e.target.closest('[data-copy]');if(!b)return;
+var t=b.getAttribute('data-copy');var done=function(){var o=b.innerHTML;b.classList.add('done');b.innerHTML='copied';setTimeout(function(){b.classList.remove('done');b.innerHTML=o;},1200);};
+if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done,function(){});}
+else{var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(err){}document.body.removeChild(ta);}});</script>`;
+
 export interface Nav { href: string; label: string; icon: string; active?: boolean }
 
 // Sidebar shell for signed-in pages.
@@ -200,7 +228,9 @@ export function appShell(opts: {
     `<a class="${n.active ? "on" : ""}" href="${esc(n.href)}">${icon(n.icon, 18)}<span>${esc(n.label)}</span></a>`).join("");
   const toast = opts.toast ? `<div class="toast">${esc(opts.toast)}</div>` : "";
   const themeBtn = `<button class="iconbtn" type="button" onclick="__toggleTheme()" title="Toggle theme" aria-label="Toggle theme">${icon("sun", 17)}</button>`;
-  const foot = `<div class="foot">${opts.account ? `<div class="who" title="${esc(opts.account)}">${esc(opts.account)}</div>` : ""}
+  const foot = `<div class="foot">
+    <a class="repo" href="${REPO_URL}" target="_blank" rel="noopener">${icon("link", 15)}<span>Source on GitHub</span></a>
+    ${opts.account ? `<div class="who" title="${esc(opts.account)}">${esc(opts.account)}</div>` : ""}
     <div class="row" style="gap:8px">${themeBtn}<a class="iconbtn grow" href="/logout" title="Sign out" aria-label="Sign out" style="text-decoration:none">${icon("logout", 17)}</a></div></div>`;
   return `${head(opts.title)}
 <body><div class="app">
@@ -210,10 +240,10 @@ export function appShell(opts: {
   ${foot}
 </aside>
 <main class="main">
-  <header class="topbar"><h1 class="grow">${esc(opts.title)}</h1>${opts.actions || ""}</header>
+  <header class="topbar"><p class="ttl grow">${esc(opts.title)}</p>${opts.actions || ""}</header>
   <div class="content">${opts.body}</div>
 </main>
-</div>${toast}</body></html>`;
+</div>${toast}${copyScript}</body></html>`;
 }
 
 export { esc };

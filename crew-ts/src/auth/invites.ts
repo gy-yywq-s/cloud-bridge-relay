@@ -52,4 +52,9 @@ export function setInviteDisabled(c: Ctx, code: string, disabled: boolean): void
   c.db.prepare("UPDATE invite_codes SET disabled=? WHERE code=?").run(disabled ? 1 : 0, code.trim());
 }
 
+// Remove a code outright (disabling keeps the audit row; deleting clears it).
+export function deleteInvite(c: Ctx, code: string): void {
+  c.db.prepare("DELETE FROM invite_codes WHERE code=?").run(code.trim());
+}
+
 export { freshCode };
