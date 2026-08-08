@@ -278,7 +278,8 @@ def resend_email(to_addr, subject, text):
         data=json.dumps({"from": f"Team Relay <{frm}>", "to": [to_addr],
                          "subject": subject, "text": text}).encode(),
         headers={"Authorization": f"Bearer {key}",
-                 "Content-Type": "application/json"})
+                 "Content-Type": "application/json",
+                 "User-Agent": "cloud-bridge-relay/5"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             rid = json.loads(r.read().decode()).get("id", "")
