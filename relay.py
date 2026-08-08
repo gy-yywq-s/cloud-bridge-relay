@@ -57,7 +57,9 @@ MAX_WAIT = 55
 PRUNE_DAYS = 14
 RATE_N = 30           # max sends per box...
 RATE_WINDOW = 300     # ...per this many seconds; hard refusal, never silent
-STALE_AFTER = 600
+STALE_AFTER = 600     # a WATCHER-backed box silent this long -> watcher died
+QUIET_AFTER = 21600   # a pull-only box with work pending, silent this long
+WATCHER_GAP = 180     # polls closer together than this = something is watching
 TASK_STALL_AFTER = 7200   # claimed task silent this long -> stalled, manager told     # teamed agent silent for this long -> flagged, manager told
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 CODE_RE = re.compile(r"^\d{4}$")
@@ -165,7 +167,8 @@ def init_db():
                       ("member_no", "INTEGER"),
                       ("role", "TEXT NOT NULL DEFAULT ''"),
                       ("is_human", "INTEGER NOT NULL DEFAULT 0"),
-                      ("last_poll", "TEXT")]:
+                      ("last_poll", "TEXT"),
+                      ("prev_poll", "TEXT")]:
         try:
             c.execute(f"ALTER TABLE boxes ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
@@ -260,7 +263,7 @@ def team_card(code) -> str:
         role = r["role"] or ("owner" if r["box"] == OWNER_BOX else "-")
         env = (r["env"] or "").strip()
         tail = f" · {env}" if env and not r["is_human"] else ""
-        mark = " · STALE" if r["stale"] else ""
+        mark = " · ⚠" if r["stale"] else ""
         lines.append(f"#{r['member_no'] or 0} {who} · box:{r['box']} · "
                      f"{role} · {kind}{tail}{mark}")
     return "\n".join(lines)
@@ -744,9 +747,12 @@ async def do_poll(box, wait_s: int, take: bool):
     """take=True: legacy auto-take. take=False: ack model — messages stay
     pending until do_ack; replays return the same ids."""
     touch_box(box)
-    # last_poll is the liveness signal for delivery_status: only real polling
-    # updates it, so registering or sending never fakes "a watcher is alive".
-    db().execute("UPDATE boxes SET last_poll=? WHERE box=?", (now(), box))
+    # last_poll/prev_poll are the liveness signal: only real polling updates
+    # them, so registering or sending never fakes "a watcher is alive". The
+    # GAP between the two is what tells a watcher loop apart from a plain
+    # MCP client that only checks mail while it happens to be working.
+    db().execute("UPDATE boxes SET prev_poll=last_poll, last_poll=? WHERE box=?",
+                 (now(), box))
     db().commit()
     deadline = time.monotonic() + min(max(wait_s, 0), MAX_WAIT)
     while True:
@@ -832,12 +838,20 @@ def do_register(box, session_name, platform, environment, pool_code, role="",
     return {"ok": True, "box": box, "status": status, "pool_code": str(pool_code),
             "role": role or "(none)",
             "say_to_owner": (f"Joined crew pool {pool_code} as {box} "
-                             f"({platform}). Waiting — tell one session "
-                             f"\"crew setup {pool_code}\" when everyone is in."),
+                             f"({platform}). I am now listening for team "
+                             "mail — interrupt me anytime. When everyone has "
+                             "joined, tell any one session to run the crew "
+                             "setup."),
             "relay_rule": RELAY_RULE,
             "directive": ("YOUR BOX ID IS " + box + " — SAVE IT, it is your "
                           "permanent address (re-register with box_id=" + box +
-                          " after restarts). REGISTERED INTO WAITING POOL " +
+                          " after restarts). THEN ENTER THE LISTENING LOOP "
+                          "IMMEDIATELY AND STAY IN IT: call check_mail(" + box +
+                          ", wait_seconds=50) again and again for as long as "
+                          "this turn lasts — an idle crew member that ends "
+                          "its turn is deaf, and a team of deaf members is "
+                          "dead. Only leave the loop to act on mail, then "
+                          "return to it. REGISTERED INTO WAITING POOL " +
                           str(pool_code) +
                           ". Now poll your box (check_mail) and WAIT. Do not "
                           "send mail yet. When the owner initializes the team "
@@ -928,7 +942,7 @@ def roster_text(code):
         if ntasks:
             tail.append(f"{ntasks} task{'s' if ntasks > 1 else ''}")
         if r["stale"]:
-            tail.append("STALE — not polling")
+            tail.append("⚠ needs attention — watcher down or quiet holding work")
         lines.append("  " + " · ".join(bits) +
                      (f"   [{', '.join(tail)}]" if tail else ""))
     return "\n".join(lines)
@@ -973,7 +987,11 @@ def do_initialize_team(pool_code, coordinator_box):
                     "task_done), handoff mail auto-files tasks, discovered "
                     "work gets filed not chased, and when you hold no task "
                     "you claim a ready one before going idle. Private todo "
-                    "tools are only for micro-steps inside your claimed task.")
+                    "tools are only for micro-steps inside your claimed task. "
+                    "WORKING MODE for plain MCP sessions: while your turn "
+                    "lasts, stay in the check_mail(wait_seconds=50) loop — "
+                    "leave it only to act, then return. A member that ends "
+                    "its turn goes deaf until the human prompts it again.")
     wiz_save(code, "", {}, 0)
     return {"ok": True, **team_roster(code),
             "directive": ("TEAM CREATED AND YOU ARE THE COORDINATOR (member #1). "
@@ -1137,6 +1155,36 @@ def do_thread(mid, limit=50):
 
 
 
+
+def poll_profile(b):
+    """How this box receives mail, judged from its own polling behaviour.
+
+    A watcher/bridge polls in a tight loop, so consecutive polls are seconds
+    apart. A plain MCP client polls only while it is mid-turn, so its polls
+    are minutes or hours apart — and going silent between turns is NORMAL for
+    it, never a fault. Returns (mode, seconds_since_last_poll_or_None).
+    """
+    last, prev = b["last_poll"], b["prev_poll"]
+    if not last:
+        return "never_polled", None
+    try:
+        idle = int((datetime.now(timezone.utc)
+                    - datetime.fromisoformat(last)).total_seconds())
+    except Exception:
+        return "never_polled", None
+    gap = None
+    if prev:
+        try:
+            gap = (datetime.fromisoformat(last)
+                   - datetime.fromisoformat(prev)).total_seconds()
+        except Exception:
+            gap = None
+    watcher = gap is not None and gap < WATCHER_GAP
+    if watcher:
+        return ("watcher_live" if idle <= STALE_AFTER else "watcher_down"), idle
+    return "pull_only", idle
+
+
 def team_view_key(code):
     """Per-team 6-char read key for the human board site. Generated lazily
     for teams that predate the feature."""
@@ -1167,38 +1215,57 @@ def team_manager_box(code):
 
 
 def stale_sweep():
-    """Flag teamed agents that stopped polling; tell the manager. Clears the
-    flag (with a notice) the moment they poll again."""
-    now_dt = datetime.now(timezone.utc)
+    """Two very different situations, never conflated:
+
+    - a WATCHER died: something was polling every few seconds and stopped, so
+      mail that was arriving instantly now is not. Worth telling the manager.
+    - a PULL-ONLY member went quiet while holding work: normal silence, but if
+      it has claimed tasks or unread mail and has not looked in for hours,
+      that work is stranded.
+
+    A pull-only member that is simply between turns is NOT flagged — that is
+    its documented normal mode, not a fault.
+    """
     for b in db().execute("SELECT * FROM boxes WHERE team_code IS NOT NULL "
                           "AND is_human=0").fetchall():
-        ref = b["last_poll"] or b["last_seen"]
-        try:
-            idle = (now_dt - datetime.fromisoformat(ref)).total_seconds()
-        except Exception:
-            continue
+        mode, idle = poll_profile(b)
         mgr = team_manager_box(b["team_code"])
-        if idle > STALE_AFTER and not b["stale"]:
+        held = [f"#{t['id']} {t['title']}" for t in db().execute(
+            "SELECT id,title FROM tasks WHERE owner=? AND status='claimed'",
+            (b["box"],))]
+        unread = db().execute(
+            "SELECT count(*) n FROM deliveries WHERE recipient=? AND taken_ts IS NULL",
+            (b["box"],)).fetchone()["n"]
+        if mode == "watcher_down":
+            problem, why = True, (
+                f"WATCHER DOWN: {display_name(b)} (box {b['box']}, "
+                f"#{b['member_no']}) was receiving mail through a watcher and "
+                f"has not polled for {int(idle // 60)} min — delivery to them "
+                "has most likely stopped.")
+        elif mode == "pull_only" and idle is not None and idle > QUIET_AFTER \
+                and (held or unread):
+            problem, why = True, (
+                f"MEMBER QUIET: {display_name(b)} (box {b['box']}, "
+                f"#{b['member_no']}) is a pull-only session — normal for it to "
+                f"be silent between turns — but it has not checked in for "
+                f"{int(idle // 3600)}h while holding work.")
+        else:
+            problem, why = False, ""
+        if problem and not b["stale"]:
             db().execute("UPDATE boxes SET stale=1 WHERE box=?", (b["box"],))
             db().commit()
             if mgr and mgr != b["box"]:
-                held = [f"#{t['id']} {t['title']}" for t in db().execute(
-                    "SELECT id,title FROM tasks WHERE owner=? AND status='claimed'",
-                    (b["box"],))]
-                extra = (" They hold claimed tasks: " + "; ".join(held) +
-                         " — reassign with task_done or a new task if needed."
-                         if held else "")
-                system_mail(mgr,
-                            f"MEMBER STALE: {display_name(b)} (box {b['box']}, "
-                            f"#{b['member_no']}) has not polled for "
-                            f"{int(idle // 60)} min. Work assigned to them may "
-                            f"be sitting unread.{extra}")
-        elif idle <= STALE_AFTER and b["stale"]:
+                extra = ((" Claimed tasks: " + "; ".join(held) +
+                          " — consider reassigning.") if held else "")
+                if unread:
+                    extra += f" {unread} message(s) unread."
+                system_mail(mgr, why + extra)
+        elif not problem and b["stale"]:
             db().execute("UPDATE boxes SET stale=0 WHERE box=?", (b["box"],))
             db().commit()
             if mgr and mgr != b["box"]:
                 system_mail(mgr, f"MEMBER BACK: {display_name(b)} "
-                                 f"(box {b['box']}) is polling again.")
+                                 f"(box {b['box']}) is active again.")
 
 
 def stale_loop():
@@ -1262,10 +1329,15 @@ def do_history(box, limit=50):
 # 1111". Every status line, question and confirmation is authored HERE and
 # relayed verbatim, so no session has to invent phrasing or be told how to
 # behave by the human.
-RELAY_RULE = ("Show `say_to_owner` to the human EXACTLY as written and say "
-              "nothing else — no preamble, no summary, no invented status. "
-              "Translate it if the human is writing in another language, but "
-              "keep every fact and option identical.")
+RELAY_RULE = (
+    "PRESENTATION RULE: give the human every fact, option and default in "
+    "this response — nothing added, nothing dropped, nothing decided on "
+    "their behalf. The prose is YOURS: use your interface's best formatting "
+    "(markdown tables and lists where they help), speak the human's "
+    "language, and use the first person when an item refers to your own "
+    "box. Never paste raw separators, ids or ASCII layout at the human when "
+    "a table or sentence is clearer. Facts and sequence are fixed; "
+    "wording and format are not.")
 
 
 def find_team_by_pool(pool_code):
@@ -1946,6 +2018,81 @@ def wiz_apply(code, step_id, answer):
     return True, {}
 
 
+
+def wiz_pending_steps(code):
+    answers = wiz_answers(code)
+    return [s for s in wiz_steps(code) if s["id"] not in answers]
+
+
+def wiz_questions(code, restart=False):
+    """The whole remaining interview as ONE batch. The agent asks the human
+    everything in a single message (ideally via the host's structured
+    question tool) and submits all answers together."""
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
+        return {"error": "no_such_team"}
+    if restart:
+        wiz_save(code, "", {}, 0)
+    steps = wiz_pending_steps(code)
+    if not steps:
+        return wiz_next(code)  # emits the done payload
+    return {
+        "team": code,
+        "questions": [{"step_id": s["id"], "question": s["ask"],
+                       "options": s["options"],
+                       "default": s["default"] or "<team-name>-<number>"}
+                      for s in steps],
+        "directive": (
+            "Ask the human ALL of these questions in ONE message — one "
+            "round-trip, not one question per turn. If your host has a "
+            "structured question tool (Claude Code: AskUserQuestion; use "
+            "your platform's equivalent form UI if it exists), present them "
+            "through it with the options and defaults; otherwise a single "
+            "numbered message. 'default' is always a valid answer. Do not "
+            "answer for the human, do not skip questions, do not invent "
+            "extra ones. Then call setup_answers(code, answers={step_id: "
+            "answer, ...}) with everything they said."),
+        "relay_rule": RELAY_RULE,
+    }
+
+
+def wiz_answers_batch(code, answers):
+    """Apply a batch of interview answers in step order. Per-item errors do
+    not block the rest; whatever remains unanswered comes back as the next
+    batch."""
+    r = wiz_row(code)
+    if r and r["done"]:
+        return {"error": "setup_already_done",
+                "detail": "setters are unlocked; or setup_questions(restart=true)"}
+    if not isinstance(answers, dict):
+        return {"error": "bad_answers", "detail": "answers is {step_id: answer}"}
+    applied, errors, handoffs = [], {}, []
+    for step in wiz_steps(code):
+        sid = step["id"]
+        if sid not in answers or sid in wiz_answers(code):
+            continue
+        ok, extra = wiz_apply(code, sid, str(answers[sid]))
+        if not ok:
+            errors[sid] = extra
+            continue
+        done_answers = wiz_answers(code)
+        done_answers[sid] = str(answers[sid])
+        wiz_save(code, sid, done_answers, 0)
+        applied.append(sid)
+        if extra.get("handoff"):
+            handoffs.append(extra)
+    out = {"applied": applied}
+    if errors:
+        out["errors"] = errors
+    if handoffs:
+        out["handoffs"] = handoffs
+        out["directive"] = ("Finish the handoff flows above, then call "
+                           "setup_questions again for whatever remains.")
+        return out
+    nxt = wiz_questions(code)
+    out["next"] = nxt
+    return out
+
+
 def wiz_next(code, restart=False):
     if not db().execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
         return {"error": "no_such_team"}
@@ -1983,16 +2130,20 @@ def wiz_next(code, restart=False):
             "answers": answers,
             "say_to_owner": ("Setup complete. Here is your crew:\n\n" + roster_text(code) +
                              f"\n\nLive board: https://board.gaelis.cc — view key: "
-                             f"{team_view_key(code)} (read-only, keep it semi-private)." +
-                             "\n\nEveryone has been notified. Say \"crew "
-                             "setup " + code + " restart\" to redo this "
-                             "interview, or name a single change any time."),
+                             f"{team_view_key(code)} (read-only, keep it semi-private). "
+                             "To change anything later — a name, a role, the whole "
+                             "setup — just say so in plain words; no ids to remember, "
+                             "your sessions know the team."),
             "relay_rule": RELAY_RULE,
-            "directive": ("SETUP IS COMPLETE. Show the owner this team card "
-                          "verbatim as the final confirmation. Configuration "
-                          "setters are now unlocked for later edits, and "
-                          "setup_next(restart=true) re-runs the whole "
-                          "interview.")}
+            "directive": ("SETUP IS COMPLETE. Present the team to the owner "
+                          "per the relay rule (nice formatting, their "
+                          "language), REMEMBER the team id yourself — the "
+                          "human is never expected to repeat it — then ENTER "
+                          "THE LISTENING LOOP: check_mail(your_box, "
+                          "wait_seconds=50) repeatedly for as long as this "
+                          "turn lasts. Setters are unlocked for later edits; "
+                          "a plain-language request from the human is enough "
+                          "to change or rerun anything.")}
 
 
 def wiz_answer(code, step_id, answer):
@@ -2245,14 +2396,14 @@ USAGE = {
         "A_plain_MCP_client": (
             "If you connected crew as an ordinary MCP connector (claude.ai "
             "connector, Codex config.toml, or `claude mcp add`), you are "
-            "PULL-ONLY. You receive by calling check_mail, and only while you "
-            "are actively taking a turn — you cannot listen in the background "
-            "and you cannot be steered. Practical pattern: call check_mail at "
-            "the start of your turn and again whenever you finish a unit of "
-            "work; ack what you processed. Between turns you simply won't hear "
-            "anything until the human or a task prompts you again. That is "
-            "expected, not a bug. Do NOT claim you will be 'steered' or "
-            "'pushed to' — that is not available to a plain MCP client."),
+            "PULL-ONLY: no background listening, no steering. WORKING MODE: "
+            "while the team is active and you have a turn, STAY in a "
+            "check_mail(wait_seconds=50) loop — leave it to act on mail, ack "
+            "what you processed, return to the loop. Do not end your turn "
+            "while teammates may still write to you; a member that ends its "
+            "turn is deaf until the human prompts it again (that silence "
+            "between turns is expected, not a fault). Never claim you will "
+            "be steered or pushed to — that needs an operator bridge."),
         "B_operator_run_bridge_push": (
             "Real-time push exists only when the OPERATOR (the human running "
             "the session) launched a delivery bridge OUTSIDE crew: for Claude "
@@ -2323,35 +2474,32 @@ mcp = FastMCP(
 
 @mcp.prompt(name="onboard")
 def prompt_onboard() -> str:
-    """Join a crew pool and wait. Triggered by "crew onboard <code>"."""
+    """Join a crew pool and stand by. Triggered by "crew onboard <code>"."""
     return (
         "The human gave you a 4-digit crew pool code. Do exactly this:\n"
-        "1. Call crew_onboard(pool_code, platform, environment, "
-        "session_name). platform is 'claude-code' or 'codex' — whichever you "
-        "actually are. Do not ask the human anything; you already know your "
-        "platform and machine.\n"
-        "2. Show the returned `say_to_owner` line verbatim and nothing else. "
-        "SAVE the box id from the response — it is your permanent address.\n"
-        "3. Then follow `delivery` guidance: crew has no push tool of its "
-        "own, so unless a watcher/bridge is running you hear mail only while "
-        "you are taking a turn. Call check_mail when you act, ack what you "
-        "processed, and never claim you will be pushed to when you won't be. "
-        "Call delivery_status(your_box) if the human asks how you receive.\n"
-        "4. When you do send mail, use a template "
-        "(status/milestone/blocker/question/handoff/result/note) — free-form "
-        "prose is refused. If you can run code, curl <relay>/client/python "
-        "for a ready client with an ack-safe inbox loop.\n"
-        "5. BOARD DISCIPLINE (the team task board is yours, not the "
-        "human's — they never have to plan for you): any unit of work that "
-        "outlives your current turn belongs on the board. Hand work to a "
-        "teammate with a `handoff` mail (it auto-files a task); file work "
-        "you DISCOVER with task_add(discovered_from=...) instead of chasing "
-        "it; before going idle, check_mail then task_claim a ready task if "
-        "you hold none (check_mail reminds you). Your session's own private "
-        "todo tools are for micro-steps INSIDE your claimed task only — the "
-        "board is the single source of truth for shared work.\n"
-        "6. Obey the directive on every message: ACTION = act and reply, "
-        "THIS IS A CC = read only, SYSTEM NOTICE = follow, never reply."
+        "1. GATHER REAL FACTS about yourself first — do not guess and never "
+        "copy an example. environment is 'where / hardware / OS+version', "
+        "found by actually looking (uname -a, /etc/os-release, sysctl or "
+        "system_profiler for CPU/RAM/disk). platform is 'claude-code' or "
+        "'codex' — what you actually are. Be precise about WHERE you run: "
+        "'cloud session' means the vendor's hosted cloud product; a session "
+        "SSH'd into or running on a server is 'remote session on <host>'.\n"
+        "2. Call crew_onboard(pool_code, platform, environment, "
+        "session_name). Show the returned say_to_owner per the relay rule.\n"
+        "3. SAVE the box id from the response — your permanent address.\n"
+        "4. ENTER THE LISTENING LOOP AND STAY IN IT: check_mail(your_box, "
+        "wait_seconds=50), repeatedly, for as long as this turn lasts. Leave "
+        "the loop only to act on mail, then return. Do not end your turn "
+        "while the team is active — a member that ends its turn is deaf.\n"
+        "5. Mail is templated (status/milestone/blocker/question/handoff/"
+        "result/note); missing fields are refused. Obey each message's "
+        "directive: ACTION = act and reply; CC = read only; SYSTEM = follow, "
+        "never reply.\n"
+        "6. BOARD DISCIPLINE: work that outlives your turn goes on the team "
+        "board; handoff mail auto-files tasks; file discovered work with "
+        "discovered_from instead of chasing it; hold no task -> claim a "
+        "ready one; private todo tools only for micro-steps inside your "
+        "claimed task."
     )
 
 
@@ -2359,23 +2507,25 @@ def prompt_onboard() -> str:
 def prompt_setup() -> str:
     """Run the team setup interview. Triggered by "crew setup <code>"."""
     return (
-        "The human said to set up a crew. They will not explain the "
-        "procedure — it is your job to follow this exactly:\n"
-        "1. Call crew_setup(pool_or_team, my_box). It forms the team if "
-        "needed and returns the FIRST question.\n"
-        "2. Show `say_to_owner` to the human VERBATIM and say nothing else. "
-        "No preamble, no summary, no invented status, no batching of "
-        "questions. Translate only if they write in another language.\n"
-        "3. Pass their reply straight to setup_answer(code, step_id, "
-        "answer) — 'default' is a valid answer. Show the next "
-        "`say_to_owner`. Repeat until done:true, then show the final "
-        "`say_to_owner` (the team card).\n"
-        "4. Two steps hand work back: 'owner_setup' (run the "
-        "add-owner-mailbox flow, then call setup_next again) and mode 'd' "
-        "(turn their wording into hard rules, read them back, get an "
-        "explicit yes, call set_owner_mode, then setup_next again).\n"
-        "set_team_name / set_member_alias / set_box_role / "
-        "attach_owner_to_team are REFUSED until the interview finishes."
+        "The human asked you to set up the crew. The interview is "
+        "server-driven; your job is to relay it well:\n"
+        "1. Call crew_setup(pool_or_team, my_box). If it says you are not in "
+        "the pool, crew_onboard yourself first and call it again — never "
+        "hand the instruction back to the human.\n"
+        "2. It returns ALL remaining questions as one batch. Ask the human "
+        "everything in ONE message: use your host's structured question "
+        "tool if you have one (Claude Code: AskUserQuestion, with the "
+        "options and defaults as choices); otherwise one well-formatted "
+        "message. Present per the relay rule — their language, clean "
+        "formatting, first person where a question is about you. Never "
+        "answer for them; 'default' is always valid.\n"
+        "3. Submit everything with setup_answers(code, answers). Fix any "
+        "per-item errors it reports, run any handoffs it names "
+        "(owner-mailbox flow, custom mode d), then call setup_questions "
+        "again until done.\n"
+        "4. On done: present the team card nicely, remember the team id "
+        "yourself (the human never repeats ids), and enter the "
+        "check_mail listening loop."
     )
 
 
@@ -2547,12 +2697,19 @@ async def crew_setup(pool_or_team: str, my_box: str,
         code = find_team_by_pool(key)
         if not code:
             r = do_initialize_team(key, my_box)
+            if r.get("error") == "not_in_pool":
+                r["directive"] = ("You are not registered in this pool. Call "
+                                  "crew_onboard with this pool code NOW and "
+                                  "then call crew_setup again yourself — do "
+                                  "NOT hand this back to the human, they "
+                                  "already told you what they want.")
+                return r
             if r.get("error"):
                 return r
             code = r["team_code"]
     else:
         code = key
-    return wiz_next(code, restart)
+    return wiz_questions(code, restart)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -2567,6 +2724,24 @@ async def setup_next(code: str, restart: bool = False) -> dict:
     restart=true re-runs the whole interview (settings are revisitable).
     """
     return wiz_next(str(code), restart)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def setup_questions(code: str, restart: bool = False) -> dict:
+    """The remaining team-setup interview as ONE batch. Ask the human all of
+    it in a single message (Claude Code: via AskUserQuestion with options;
+    otherwise one numbered message), then submit setup_answers. Prefer this
+    over setup_next — one round-trip instead of one per question."""
+    return wiz_questions(str(code), restart)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def setup_answers(code: str, answers: dict) -> dict:
+    """Submit the human's answers for several interview steps at once:
+    answers={step_id: answer}. Per-item problems come back under `errors`
+    without blocking the rest; `next` holds whatever is still unanswered or
+    the completion payload."""
+    return wiz_answers_batch(str(code), answers)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -2637,11 +2812,13 @@ async def send_mail(sender_box: str, to: list[str], template: str = "note",
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def check_mail(box: str, wait_seconds: int = 25,
                      ack_through: int = 0) -> list[dict]:
-    """Pull your mailbox (ACK MODEL). This is how a PLAIN MCP CLIENT
-    receives — crew has no push tool, so if no operator bridge is running,
-    calling this is the only way you hear anything, and only while you have a
-    turn. (If mail already arrives on its own, a bridge is delivering it; do
-    not also poll.)
+    """Pull your mailbox (ACK MODEL). For a plain MCP client THE LOOP IS
+    THE WORKING MODE: while your team is active and you have a turn, call
+    this with wait_seconds=50 again and again — leave the loop to act on
+    mail, then come back. Ending your turn makes you deaf until the human
+    prompts you again, so do not stop while teammates may still write to
+    you. (If mail already arrives on its own, an operator bridge is
+    delivering it; then do not also poll.)
 
     Messages returned here are NOT consumed. After you have PROCESSED a
     batch, acknowledge it: either call ack_mail(box, through_id=<highest id
@@ -2900,6 +3077,14 @@ async def _r_owner_mode(_req, p):
                              p.get("persistent"))
 
 
+async def _r_setup_questions(_req, p):
+    return wiz_questions(p.get("code", ""), bool(p.get("restart")))
+
+
+async def _r_setup_answers(_req, p):
+    return wiz_answers_batch(p.get("code", ""), p.get("answers"))
+
+
 async def _r_setup_next(_req, p):
     return wiz_next(p.get("code", ""), bool(p.get("restart")))
 
@@ -3080,6 +3265,8 @@ app.router.routes.extend([
     Route("/owner/setup", _json_route(_r_owner_setup), methods=["POST"]),
     Route("/owner/confirm", _json_route(_r_owner_confirm), methods=["POST"]),
     Route("/owner/mode", _json_route(_r_owner_mode), methods=["POST"]),
+    Route("/setup/questions", _json_route(_r_setup_questions), methods=["POST"]),
+    Route("/setup/answers", _json_route(_r_setup_answers), methods=["POST"]),
     Route("/setup/next", _json_route(_r_setup_next), methods=["POST"]),
     Route("/setup/answer", _json_route(_r_setup_answer), methods=["POST"]),
     Route("/team", _json_route(_r_team)),
