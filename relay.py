@@ -42,7 +42,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from pydantic import Field, create_model
+
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
@@ -2093,6 +2095,56 @@ def wiz_answers_batch(code, answers):
     return out
 
 
+
+def client_can_elicit(ctx):
+    try:
+        caps = ctx.session.client_params.capabilities
+        return getattr(caps, "elicitation", None) is not None
+    except Exception:
+        return False
+
+
+async def wiz_run_interactive(code, ctx, restart=False):
+    """Server-driven interview via MCP elicitation: the HOST renders a native
+    form (Claude Code CLI >= 2.1.76, Codex via its form extension); the agent
+    never phrases the questions at all. Hosts without elicitation get the
+    agent-mediated batch (wiz_questions) instead."""
+    if restart:
+        wiz_save(code, "", {}, 0)
+    if ctx is None or not client_can_elicit(ctx):
+        return wiz_questions(code)
+    for _round in range(4):
+        steps = wiz_pending_steps(code)
+        if not steps:
+            return wiz_next(code)
+        fields = {}
+        for s in steps:
+            desc = s["ask"]
+            opts = " / ".join(s["options"])
+            desc += f"  [{opts}; 'default' = {s['default'] or '<team-name>-<number>'}]"
+            fields[s["id"]] = (str, Field(default="default", description=desc))
+        Model = create_model("CrewSetup", **fields)
+        try:
+            result = await ctx.elicit(
+                message=("Crew team setup — answer what you like, leave "
+                         "'default' anywhere to accept the default."),
+                schema=Model)
+        except Exception:
+            return wiz_questions(code)  # host claimed support but failed
+        if getattr(result, "action", None) != "accept":
+            return {"cancelled": True,
+                    "directive": ("The human dismissed the setup form. Ask "
+                                  "them in plain words whether to continue "
+                                  "setup, and on yes call crew_setup again — "
+                                  "or use setup_questions for the "
+                                  "text-based flow.")}
+        out = wiz_answers_batch(code, result.data.model_dump())
+        if out.get("handoffs"):
+            return out
+        # per-item errors (e.g. name_taken) loop back into the next form
+    return wiz_questions(code)
+
+
 def wiz_next(code, restart=False):
     if not db().execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
         return {"error": "no_such_team"}
@@ -2460,8 +2512,10 @@ USAGE = {
 # Behind the hostd gateway the public Host is crew.gaelis.cc; the SDK's
 # DNS-rebinding protection defaults to localhost-only and answers 421 to
 # everything else, so list the real hosts explicitly.
+# Sessioned + SSE (not stateless/json): elicitation needs the server to send
+# a request back to the client in the middle of a tool call.
 mcp = FastMCP(
-    "crew", stateless_http=True, json_response=True,
+    "crew", stateless_http=False, json_response=False,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=["crew.gaelis.cc", "localhost", "127.0.0.1",
@@ -2683,14 +2737,15 @@ async def crew_onboard(pool_code: str, platform: str, environment: str,
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def crew_setup(pool_or_team: str, my_box: str,
-                     restart: bool = False) -> dict:
+                     restart: bool = False, ctx: Context = None) -> dict:
     """ENTRY POINT when the human says something like "crew setup 1234".
 
-    One call, no questions asked first: if that pool has no team yet this
-    forms one (you become coordinator), then it returns the FIRST setup
-    question. From there just relay `say_to_owner`, send the human's reply to
-    setup_answer, and repeat until done. The human never has to explain the
-    procedure to you — it is all in these responses.
+    One call: forms the team from the pool if needed (you become
+    coordinator), then runs the setup interview. On hosts with elicitation
+    (Claude Code CLI, Codex) the questions appear as a NATIVE FORM handled
+    entirely by the server — you do nothing until it returns. Elsewhere it
+    returns the question batch for you to relay (see setup_questions). Either
+    way the human never explains the procedure — it is all in the responses.
     """
     key = str(pool_or_team).strip()
     if CODE_RE.match(key):
@@ -2709,7 +2764,7 @@ async def crew_setup(pool_or_team: str, my_box: str,
             code = r["team_code"]
     else:
         code = key
-    return wiz_questions(code, restart)
+    return await wiz_run_interactive(code, ctx, restart)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
