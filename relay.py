@@ -154,6 +154,8 @@ def init_db():
             pass
     for tbl, col, decl in [("messages", "kind", "TEXT NOT NULL DEFAULT 'mail'"),
                            ("messages", "client_key", "TEXT"),
+                           ("teams", "rv", "INTEGER NOT NULL DEFAULT 1"),
+                           ("boxes", "seen_rv", "INTEGER NOT NULL DEFAULT 0"),
                            ("deliveries", "email_status", "TEXT"),
                            ("teams", "pool_code", "TEXT NOT NULL DEFAULT ''")]:
         try:
@@ -213,6 +215,13 @@ def sender_stamp(box, fallback_alias=""):
             "member_no": b["member_no"], "team": b["team_code"],
             "platform": b["platform"] or "unknown",
             "role": b["role"], "is_human": bool(b["is_human"])}
+
+
+def bump_rv(code):
+    """Roster version: any setup change bumps it; footers go full once per
+    recipient per version, brief otherwise."""
+    db().execute("UPDATE teams SET rv=rv+1 WHERE code=?", (code,))
+    db().commit()
 
 
 def team_card(code) -> str:
@@ -595,7 +604,7 @@ def touch_box(box, **fields):
     conn.commit()
 
 
-def envelope(row):
+def envelope(row, recipient=None):
     stamp = (sender_stamp(row["sender"], row["alias"])
              if row["sender"] != "relay" else
              {"box": "relay", "display_name": "relay", "member_no": None,
@@ -607,7 +616,23 @@ def envelope(row):
          "delivered_as": row["delivered_as"], "directive": DIRECTIVES[dkey],
          "body": row["body"]}
     if stamp["team"]:
-        e["team_info"] = team_card(stamp["team"])
+        t = db().execute("SELECT name, rv FROM teams WHERE code=?",
+                         (stamp["team"],)).fetchone()
+        rv = t["rv"] if t else 1
+        tname = (t["name"] if t and t["name"] else stamp["team"])
+        n = db().execute("SELECT count(*) c FROM boxes WHERE team_code=?",
+                         (stamp["team"],)).fetchone()["c"]
+        rb = box_row(recipient) if recipient else None
+        # Full card once per recipient per roster version; brief line after.
+        if rb is not None and (rb["seen_rv"] or 0) < rv:
+            e["team_info"] = team_card(stamp["team"])
+            db().execute("UPDATE boxes SET seen_rv=? WHERE box=?",
+                         (rv, recipient))
+            db().commit()
+        else:
+            e["team_info"] = (f"team {tname} · {stamp['team']} · {n} members "
+                              f"· roster v{rv} · list_team('{stamp['team']}') "
+                              "for detail")
     return e
 
 
@@ -616,7 +641,7 @@ def fetch_box(box, take: bool):
     rows = conn.execute(
         "SELECT m.*, d.delivered_as FROM deliveries d JOIN messages m ON m.id=d.msg_id "
         "WHERE d.recipient=? AND d.taken_ts IS NULL ORDER BY m.id", (box,)).fetchall()
-    out = [envelope(r) for r in rows]
+    out = [envelope(r, recipient=box) for r in rows]
     if take and rows:
         conn.executemany(
             "UPDATE deliveries SET taken_ts=? WHERE msg_id=? AND recipient=?",
@@ -696,13 +721,25 @@ def do_pool(pool_code):
                          "last_seen": r["last_seen"]} for r in rows]}
 
 
-def team_roster(code):
+def team_roster(code, view="full"):
     rows = db().execute(
         "SELECT * FROM boxes WHERE team_code=? ORDER BY member_no", (code,)).fetchall()
     t = db().execute("SELECT * FROM teams WHERE code=?", (code,)).fetchone()
     pending = {r["box"]: db().execute(
         "SELECT count(*) n FROM deliveries WHERE recipient=? AND taken_ts IS NULL",
         (r["box"],)).fetchone()["n"] for r in rows}
+    if view == "brief":
+        return {
+            "team_code": code,
+            "team_name": t["name"] if t else "",
+            "roster_v": t["rv"] if t else 1,
+            "members": [
+                f"#{r['member_no'] or 0} {display_name(r)} · box:{r['box']} · "
+                f"{r['role'] or ('owner' if r['box'] == OWNER_BOX else '-')} · "
+                f"{'human' if r['is_human'] else (r['platform'] or 'unknown')}"
+                for r in rows],
+            "pending_total": sum(pending.values()),
+        }
     return {
         "team_code": code,
         "team_name": t["name"] if t else "",
@@ -785,6 +822,7 @@ def do_join_team(code, box):
     db().execute("UPDATE boxes SET status='teamed', team_code=?, member_no=? "
                  "WHERE box=?", (code, nxt, box))
     db().commit()
+    bump_rv(code)
     broadcast_team(code, f"TEAM UPDATE: box '{box}' joined as member #{nxt}.\n\n"
                          + team_card(code))
     return {"ok": True, "member_no": nxt, **team_roster(code)}
@@ -796,6 +834,7 @@ def do_set_team_name(code, name):
         return {"error": "no_such_team"}
     db().execute("UPDATE teams SET name=? WHERE code=?", (str(name)[:100], code))
     db().commit()
+    bump_rv(code)
     broadcast_team(code, f"SETUP CHANGE: team {code} is now named '{name}'. "
                          "Unaliased members display as '<name>-<no>'.\n\n"
                          + team_card(code))
@@ -810,6 +849,7 @@ def do_set_member_alias(code, member_no, alias):
         return {"error": "no_such_member"}
     db().execute("UPDATE boxes SET alias=? WHERE box=?", (str(alias)[:200], r["box"]))
     db().commit()
+    bump_rv(code)
     broadcast_team(code, f"SETUP CHANGE: member #{member_no} ({r['box']}) is "
                          f"now named '{alias}'.\n\n" + team_card(code))
     return {"ok": True, **team_roster(code)}
@@ -825,6 +865,7 @@ def do_set_box_role(code, member_no, role):
         return {"error": "no_such_member"}
     db().execute("UPDATE boxes SET role=? WHERE box=?", (role, r["box"]))
     db().commit()
+    bump_rv(code)
     extra = ("HARD RULE now active for this member: workers never contact the "
              "owner; they report to the manager." if role == "worker" else
              "This member now handles owner contact for the team.")
@@ -846,6 +887,7 @@ def do_attach_owner(code):
     db().execute("UPDATE boxes SET team_code=?, member_no=0, status='teamed' "
                  "WHERE box=?", (code, OWNER_BOX))
     db().commit()
+    bump_rv(code)
     mode = o["mode"]
     rules = o["custom_rules"] or OWNER_MODES[mode]["rules"]
     broadcast_team(code,
@@ -950,7 +992,7 @@ USAGE = {
         "POST /team/alias": "{code, member_no, alias}",
         "POST /team/role": "{code, member_no, role}",
         "POST /team/attach-owner": "{code}",
-        "GET /team?code=X": "roster + team card",
+        "GET /team?code=X&view=brief|full": "roster (brief: one line per member; full: everything + card)",
         "POST /owner/setup": "{full_name, alias?, email}",
         "POST /owner/confirm": "{override?}",
         "POST /owner/mode": "{mode, custom_rules?, allow_senders?, allow_direct?, persistent?}",
@@ -1160,9 +1202,12 @@ async def attach_owner_to_team(code: str) -> dict:
 
 
 @mcp.tool()
-async def list_team(code: str) -> dict:
-    """One-call roster + formatted team card for a team id (tm-xxxxxx)."""
-    return team_roster(str(code))
+async def list_team(code: str, view: str = "brief") -> dict:
+    """Team roster for a team id (tm-xxxxxx). view="brief" (default): one
+    line per member — number, name, box, role, platform — enough for
+    routing. view="full": every field (session_name, environment, last_seen,
+    per-member pending) plus the formatted team card; use for setup/debug."""
+    return team_roster(str(code), view if view in ("brief", "full") else "brief")
 
 
 @mcp.tool()
@@ -1319,7 +1364,9 @@ async def _r_owner_mode(_req, p):
 
 
 async def _r_team(req, _p):
-    return team_roster(req.query_params.get("code", ""))
+    view = req.query_params.get("view", "brief")
+    return team_roster(req.query_params.get("code", ""),
+                       view if view in ("brief", "full") else "brief")
 
 
 async def _r_pool(req, _p):
