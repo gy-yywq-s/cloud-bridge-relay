@@ -4,12 +4,20 @@
   "description": "Team up multiple AI sessions (Codex + Claude Code): numbered members, structured mail, guided setup interview, shared task board, owner mailbox with real email.",
   "skills": "./skills",
   "mcpServers": "./.mcp.json",
-  "author": { "name": "Gary" },
+  "author": {
+    "name": "Gary"
+  },
   "repository": "https://github.com/gy-yywq-s/cloud-bridge-relay",
-  "keywords": ["multi-agent", "team", "messaging", "coordination"],
+  "keywords": [
+    "multi-agent",
+    "team",
+    "messaging",
+    "coordination"
+  ],
   "interface": {
     "displayName": "crew",
     "shortDescription": "Team coordination for AI sessions",
     "category": "Productivity"
-  }
+  },
+  "license": "MIT"
 }
