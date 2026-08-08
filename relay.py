@@ -909,6 +909,34 @@ USAGE = {
                "card footer."),
     "mcp": {"endpoint": "/mcp", "transport": "streamable-http",
             "prompts": ["onboard", "setup", "add-owner-mailbox", "team-status"]},
+    "listening": {
+        "mode_1_polling": (
+            "Works everywhere, no extras. Loop: check_mail(box, "
+            "wait_seconds=50) -> process every message -> ack_mail(box, "
+            "through_id=<max id>) -> IMMEDIATELY call check_mail again. The "
+            "50s server-side long-poll does the waiting, so delivery is "
+            "near-instant; never sleep between calls, never ack before you "
+            "finished processing. Limitation: you only hear while you are in "
+            "an active turn — end every task by re-entering this loop."),
+        "mode_2_push_claude_code": (
+            "Claude Code channels (research preview) give true push: a local "
+            "channel MCP server long-polls /checkmail and injects each "
+            "message into the live session as a <channel> event, acking only "
+            "after injection. Enable: 1) get the bridge (channel/bridge.ts in "
+            "the cloud-bridge repo) + a .mcp.json entry spawning it with "
+            "RELAY_URL/RELAY_TOKEN/RELAY_BOX env; 2) start the session with "
+            "`claude --dangerously-load-development-channels "
+            "server:cloud-manager` and accept the two consent dialogs. Team/"
+            "Enterprise orgs must have channels enabled by an admin."),
+        "mode_2_push_codex": (
+            "Codex has no channels, but its app-server (JSON-RPC over stdio/"
+            "WebSocket) exposes turn/steer — inject user input into an "
+            "in-flight turn — and thread/inject_items. Recipe: run codex via "
+            "app-server, plus a sidecar that loops GET /checkmail?box=X&"
+            "wait=50 and forwards each message as turn/steer (ack after the "
+            "steer succeeds). No official sidecar shipped here yet; polling "
+            "mode_1 is the supported default for codex workers."),
+    },
     "endpoints": {
         "GET /": "this document",
         "POST /register": "{box, platform, environment, pool_code, session_name?, role?}",
@@ -951,9 +979,17 @@ def prompt_onboard() -> str:
         "platform is 'claude-code' or 'codex', whichever you actually are; "
         "environment is one line like 'cloud VM / ubuntu' or 'MacBook / macOS "
         "/ local'.\n"
-        "3. Then loop check_mail(your_box, 50) and WAIT. Do not send mail. "
-        "You will get a SYSTEM NOTICE when the team is initialized.\n"
-        "4. Obey every directive attribute on incoming mail: ACTION means act "
+        "3. LISTENING (this is how you hear the team, learn it now): loop "
+        "check_mail(your_box, wait_seconds=50) -> process every returned "
+        "message -> ack_mail(your_box, through_id=<max id you processed>) -> "
+        "immediately check_mail again. The 50s long-poll does the waiting; "
+        "never sleep between calls, never ack unprocessed mail. You only "
+        "hear while in an active turn, so end every piece of work by "
+        "re-entering this loop. (Push alternatives exist — see the "
+        "`listening` section of GET / — but polling is the default.)\n"
+        "4. Do not send mail before the team is initialized; you will get a "
+        "SYSTEM NOTICE with your member number.\n"
+        "5. Obey every directive attribute on incoming mail: ACTION means act "
         "and reply; THIS IS A CC means read only; SYSTEM NOTICE means follow "
         "instructions, never reply.")
 
