@@ -4,13 +4,17 @@
 Auth: hostd gateway (bearer / OAuth); this process is loopback-only.
 
 Lifecycle a session follows (the MCP tool docs repeat this):
-  1. register_box(box, platform, environment, session_name?) -> waiting pool
-  2. The owner hands a 4-digit team code to ONE session; it calls
-     create_team(code, its_box) -> every waiting box becomes a numbered member
-  3. That coordinator asks the owner for a team name (set_team_name) and
+  1. register_box(box, platform, environment, pool_code, session_name?) ->
+     enters the waiting pool for that owner-issued 4-digit code (same code =
+     same pool; pool codes may repeat over time).
+  2. One session is told to monitor the pool: watch_pool(pool_code).
+  3. When the owner says 'initialize', that session calls
+     initialize_team(pool_code, its_box) -> every waiting box in the pool
+     becomes a numbered member under a unique random team id (tm-xxxxxx).
+  4. The coordinator asks the owner for a team name (set_team_name) and
      optional per-member aliases (set_member_alias). Unset alias displays as
      "<team_name>-<member_no>".
-  4. list_team(code) -> one-call roster.
+  5. list_team(team_id) -> one-call roster.
 
 Every delivery carries an explicit `directive` line (ACTION / THIS IS A CC /
 SYSTEM NOTICE) and the sender's platform stamp, so a cc'd Codex session can
@@ -20,6 +24,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -85,18 +90,24 @@ def init_db():
       created_ts TEXT NOT NULL, last_seen TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS teams(
       code TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+      pool_code TEXT NOT NULL DEFAULT '',
       coordinator TEXT NOT NULL, created_ts TEXT NOT NULL);
     """)
     for col, decl in [("session_name", "TEXT NOT NULL DEFAULT ''"),
                       ("platform", "TEXT NOT NULL DEFAULT ''"),
                       ("env", "TEXT NOT NULL DEFAULT ''"),
                       ("status", "TEXT NOT NULL DEFAULT 'active'"),
+                      ("pool_code", "TEXT"),
                       ("team_code", "TEXT"),
                       ("member_no", "INTEGER")]:
         try:
             c.execute(f"ALTER TABLE boxes ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
+    try:
+        c.execute("ALTER TABLE teams ADD COLUMN pool_code TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     for col, decl in [("kind", "TEXT NOT NULL DEFAULT 'mail'")]:
         try:
             c.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
@@ -254,22 +265,30 @@ async def do_poll(box, wait_s: int):
         await asyncio.sleep(1.0)
 
 
-def do_register(box, session_name, platform, environment):
+def do_register(box, session_name, platform, environment, pool_code):
     if not BOX_RE.match(box or ""):
         return {"error": "bad_box", "detail": BOX_RE.pattern}
     if platform not in PLATFORMS:
         return {"error": "bad_platform",
                 "detail": f"declare your platform: one of {PLATFORMS}. This is "
                           "mandatory so teammates know what they are talking to."}
+    if not CODE_RE.match(str(pool_code or "")):
+        return {"error": "bad_pool_code",
+                "detail": "pool_code is the 4-digit code the owner gave you; "
+                          "you cannot enter the waiting pool without it"}
     b = box_row(box)
     status = "waiting" if not (b and b["team_code"]) else b["status"]
+    conn = db()
     touch_box(box, session_name=str(session_name or "")[:200], platform=platform,
               env=str(environment or "")[:500], status=status)
-    return {"ok": True, "box": box, "status": status,
-            "directive": ("REGISTERED. YOU ARE IN THE WAITING POOL. Now poll "
-                          "your box (check_mail) and WAIT. Do not send mail "
-                          "yet. When a team is formed you will receive a "
-                          "SYSTEM NOTICE with your member number.")}
+    conn.execute("UPDATE boxes SET pool_code=? WHERE box=?", (str(pool_code), box))
+    conn.commit()
+    return {"ok": True, "box": box, "status": status, "pool_code": str(pool_code),
+            "directive": ("REGISTERED INTO WAITING POOL " + str(pool_code) + ". "
+                          "Now poll your box (check_mail) and WAIT. Do not send "
+                          "mail yet. When the owner initializes the team you "
+                          "will receive a SYSTEM NOTICE with your member "
+                          "number and team id.")}
 
 
 def team_roster(code):
@@ -295,22 +314,24 @@ def team_roster(code):
     }
 
 
-def do_create_team(code, coordinator_box):
-    if not CODE_RE.match(str(code)):
-        return {"error": "bad_code", "detail": "team code is exactly 4 digits"}
-    code = str(code)
+def do_initialize_team(pool_code, coordinator_box):
+    if not CODE_RE.match(str(pool_code)):
+        return {"error": "bad_pool_code", "detail": "pool code is exactly 4 digits"}
+    pool_code = str(pool_code)
     conn = db()
-    if conn.execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
-        return {"error": "team_exists",
-                "detail": "this code is taken; use join_team to add members"}
     coord = box_row(coordinator_box)
-    if coord is None or coord["status"] != "waiting":
-        return {"error": "not_registered",
-                "detail": "coordinator must register_box first (waiting pool)"}
+    if coord is None or coord["status"] != "waiting" or coord["pool_code"] != pool_code:
+        return {"error": "not_in_pool",
+                "detail": "coordinator must be registered in this waiting pool"}
+    while True:
+        code = "tm-" + secrets.token_hex(3)
+        if not conn.execute("SELECT 1 FROM teams WHERE code=?", (code,)).fetchone():
+            break
     waiting = conn.execute(
-        "SELECT * FROM boxes WHERE status='waiting' ORDER BY created_ts").fetchall()
-    conn.execute("INSERT INTO teams(code,name,coordinator,created_ts) VALUES(?,?,?,?)",
-                 (code, "", coordinator_box, now()))
+        "SELECT * FROM boxes WHERE status='waiting' AND pool_code=? "
+        "ORDER BY created_ts", (pool_code,)).fetchall()
+    conn.execute("INSERT INTO teams(code,name,pool_code,coordinator,created_ts) "
+                 "VALUES(?,?,?,?,?)", (code, "", pool_code, coordinator_box, now()))
     ordered = ([b for b in waiting if b["box"] == coordinator_box] +
                [b for b in waiting if b["box"] != coordinator_box])
     for i, b in enumerate(ordered, start=1):
@@ -321,7 +342,8 @@ def do_create_team(code, coordinator_box):
         if b["box"] == coordinator_box:
             continue
         system_mail(b["box"],
-                    f"TEAM FORMED. You are member #{i} of team {code} "
+                    f"TEAM FORMED from pool {pool_code}. You are member #{i} of "
+                    f"team {code} "
                     f"({len(ordered)} members; coordinator: {coordinator_box}). "
                     "Your display name defaults to <team_name>-{no} until an "
                     "alias is assigned. KEEP POLLING your box; a name "
@@ -336,6 +358,19 @@ def do_create_team(code, coordinator_box):
                           "set_member_alias. Members without an alias keep the "
                           "default '<team_name>-<member_no>'. 3) Report the "
                           "final roster back to the owner.")}
+
+
+def do_pool(pool_code):
+    if not CODE_RE.match(str(pool_code)):
+        return {"error": "bad_pool_code"}
+    rows = db().execute(
+        "SELECT * FROM boxes WHERE status='waiting' AND pool_code=? "
+        "ORDER BY created_ts", (str(pool_code),)).fetchall()
+    return {"pool_code": str(pool_code), "waiting_count": len(rows),
+            "waiting": [{"box": r["box"], "session_name": r["session_name"],
+                         "platform": r["platform"] or "unknown",
+                         "environment": r["env"], "registered": r["created_ts"],
+                         "last_seen": r["last_seen"]} for r in rows]}
 
 
 def do_join_team(code, box):
@@ -439,8 +474,9 @@ USAGE = {
     "mcp": {"endpoint": "/mcp", "transport": "streamable-http"},
     "endpoints": {
         "GET /": "this document",
-        "POST /register": "{box, session_name?, platform, environment}",
-        "POST /team/create": "{code, coordinator_box}",
+        "POST /register": "{box, session_name?, platform, environment, pool_code}",
+        "GET /pool?code=X": "who is waiting in pool X",
+        "POST /team/create": "{pool_code, coordinator_box} — initialize team from pool",
         "POST /team/join": "{code, box}",
         "POST /team/name": "{code, name}",
         "POST /team/alias": "{code, member_no, alias}",
@@ -459,29 +495,39 @@ mcp = FastMCP("cloud-bridge-relay", stateless_http=True, json_response=True)
 
 @mcp.tool()
 async def register_box(box: str, platform: str, environment: str,
-                       session_name: str = "") -> dict:
-    """Register your mailbox and enter the team waiting pool.
+                       pool_code: str, session_name: str = "") -> dict:
+    """Register your mailbox and enter a team waiting pool.
 
     box: your stable box name (lowercase, digits, - _; you keep it forever).
     platform: MANDATORY, exactly "claude-code" or "codex" — teammates must
     know what they are talking to; it is stamped on every message you send.
     environment: one line about where you run (host/OS/model), e.g.
     "MacBook M1 Pro / macOS / local".
+    pool_code: the 4-digit code the owner gave you when they pointed you at
+    this MCP — same code = same pool. No code, no pool.
     session_name: your session's current display title, if you know it.
-    After registering: poll check_mail and WAIT for the team-formation notice.
+    After registering: poll check_mail and WAIT for the initialization notice.
     """
-    return do_register(box, session_name, platform, environment)
+    return do_register(box, session_name, platform, environment, pool_code)
 
 
 @mcp.tool()
-async def create_team(code: str, coordinator_box: str) -> dict:
-    """Form a team from every session currently in the waiting pool.
+async def watch_pool(pool_code: str) -> dict:
+    """See who is currently waiting in a pool (box, session_name, platform,
+    environment, registered time). If the owner told you to monitor the pool,
+    call this periodically and report; when the owner says 'initialize',
+    call initialize_team."""
+    return do_pool(pool_code)
 
-    Call this ONLY if the owner (the human) gave YOU a 4-digit team code.
-    You become member #1 and the coordinator. The response directive tells
-    you exactly what to ask the owner next (team name, optional aliases).
-    """
-    return do_create_team(code, coordinator_box)
+
+@mcp.tool()
+async def initialize_team(pool_code: str, coordinator_box: str) -> dict:
+    """Convert everyone waiting in this pool into a team. Call this ONLY when
+    the owner (the human) says 'initialize'. You become member #1 and the
+    coordinator. A unique random team id (tm-xxxxxx) is generated — pool
+    codes may repeat, team ids never do. The response directive tells you
+    exactly what to ask the owner next (team name, optional aliases)."""
+    return do_initialize_team(pool_code, coordinator_box)
 
 
 @mcp.tool()
@@ -507,9 +553,8 @@ async def set_member_alias(code: str, member_no: int, alias: str) -> dict:
 @mcp.tool()
 async def list_team(code: str) -> dict:
     """One-call roster: number, box, display name, platform, environment,
-    last_seen and pending-mail count for every member."""
-    if not CODE_RE.match(str(code)):
-        return {"error": "bad_code"}
+    last_seen and pending-mail count for every member. `code` is the team id
+    (tm-xxxxxx) from the initialization notice."""
     return team_roster(str(code))
 
 
@@ -585,11 +630,13 @@ async def _r_health(_req, _p):
 
 async def _r_register(_req, p):
     return do_register(p.get("box", ""), p.get("session_name", ""),
-                       p.get("platform", ""), p.get("environment", ""))
+                       p.get("platform", ""), p.get("environment", ""),
+                       p.get("pool_code", ""))
 
 
 async def _r_team_create(_req, p):
-    return do_create_team(p.get("code", ""), p.get("coordinator_box", ""))
+    return do_initialize_team(p.get("pool_code", p.get("code", "")),
+                              p.get("coordinator_box", ""))
 
 
 async def _r_team_join(_req, p):
@@ -609,10 +656,11 @@ async def _r_team_alias(_req, p):
 
 
 async def _r_team(req, _p):
-    code = req.query_params.get("code", "")
-    if not CODE_RE.match(code):
-        return {"error": "bad_code"}
-    return team_roster(code)
+    return team_roster(req.query_params.get("code", ""))
+
+
+async def _r_pool(req, _p):
+    return do_pool(req.query_params.get("code", ""))
 
 
 async def _r_send(_req, p):
@@ -665,6 +713,7 @@ app.router.routes.extend([
     Route("/team/name", _json_route(_r_team_name), methods=["POST"]),
     Route("/team/alias", _json_route(_r_team_alias), methods=["POST"]),
     Route("/team", _json_route(_r_team)),
+    Route("/pool", _json_route(_r_pool)),
     Route("/send", _json_route(_r_send), methods=["POST"]),
     Route("/poll", _json_route(_r_poll)),
     Route("/peek", _json_route(_r_peek)),
