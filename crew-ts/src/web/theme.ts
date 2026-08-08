@@ -79,7 +79,7 @@ pre{font:12.5px/1.55 var(--mono);background:var(--paper-2);border:1px solid var(
 `;
 }
 
-const esc = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const esc = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
 export function page(cfg: Config, title: string, bodyHtml: string, opts: { toast?: string } = {}): string {
   const toast = opts.toast ? `<div class="toast">${esc(opts.toast)}</div>` : "";

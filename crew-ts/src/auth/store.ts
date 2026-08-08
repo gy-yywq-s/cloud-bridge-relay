@@ -13,6 +13,7 @@ import { now } from "../db.js";
 
 const TOKEN_TTL_S = 3600;
 const CODE_TTL_S = 300;
+const REFRESH_TTL_S = 60 * 60 * 24 * 30;
 const iso = (secFromNow: number) => new Date(Date.now() + secFromNow * 1000).toISOString();
 
 export function clientsStore(c: Ctx): OAuthRegisteredClientsStore {
@@ -35,25 +36,26 @@ export function clientsStore(c: Ctx): OAuthRegisteredClientsStore {
   };
 }
 
-// A pending authorization: created when /authorize redirects the human to the
-// login page; consumed when the login page mints the code after auth.
+// A pending authorization lives in its OWN table (oauth_pending), never in
+// oauth_codes — so the token endpoint cannot exchange a pre-login record for a
+// token (security review finding 1).
 export function stashPending(c: Ctx, clientId: string, params: AuthorizationParams): string {
   const pid = "ar-" + randHex(12);
-  c.db.prepare("INSERT INTO oauth_codes(code,client_id,account_id,redirect_uri,code_challenge,scope,expires_ts) VALUES(?,?,?,?,?,?,?)")
-    .run(pid, clientId, null, params.redirectUri, params.codeChallenge, (params.scopes || []).join(" "), iso(CODE_TTL_S));
-  // stash state separately in-band on the redirect URL; return the pending id
+  c.db.prepare("INSERT INTO oauth_pending(pid,client_id,redirect_uri,code_challenge,scope,expires_ts) VALUES(?,?,?,?,?,?)")
+    .run(pid, clientId, params.redirectUri, params.codeChallenge, (params.scopes || []).join(" "), iso(CODE_TTL_S));
   return pid;
 }
 
-// After the human authenticates, bind the account and issue the real code.
+// After the human authenticates, consume the pending record and issue the real
+// authorization code (account-bound) into oauth_codes.
 export function mintCode(c: Ctx, pendingId: string, accountId: number): { code: string; redirectUri: string } | null {
-  const p = c.db.prepare("SELECT * FROM oauth_codes WHERE code=?").get(pendingId) as
+  const p = c.db.prepare("SELECT * FROM oauth_pending WHERE pid=?").get(pendingId) as
     { client_id: string; redirect_uri: string; code_challenge: string; scope: string; expires_ts: string } | undefined;
   if (!p || p.expires_ts < now()) return null;
   const code = "ac-" + randHex(16);
   c.db.prepare("INSERT INTO oauth_codes(code,client_id,account_id,redirect_uri,code_challenge,scope,expires_ts) VALUES(?,?,?,?,?,?,?)")
     .run(code, p.client_id, accountId, p.redirect_uri, p.code_challenge, p.scope, iso(CODE_TTL_S));
-  c.db.prepare("DELETE FROM oauth_codes WHERE code=?").run(pendingId);
+  c.db.prepare("DELETE FROM oauth_pending WHERE pid=?").run(pendingId);
   return { code, redirectUri: p.redirect_uri };
 }
 
@@ -78,35 +80,48 @@ export function provider(c: Ctx, loginPath = "/login"): OAuthServerProvider {
       return r?.code_challenge ?? "";
     },
 
-    async exchangeAuthorizationCode(client, authorizationCode): Promise<OAuthTokens> {
+    async exchangeAuthorizationCode(client, authorizationCode, _verifier, redirectUri): Promise<OAuthTokens> {
       const r = c.db.prepare("SELECT * FROM oauth_codes WHERE code=?").get(authorizationCode) as
-        { client_id: string; account_id: number | null; scope: string; expires_ts: string } | undefined;
-      if (!r || r.client_id !== client.client_id || r.expires_ts < now()) throw new Error("invalid_grant");
+        { client_id: string; account_id: number | null; redirect_uri: string; scope: string; expires_ts: string } | undefined;
+      // real, account-bound code only; client + redirect_uri must match; single-use.
+      if (!r || r.client_id !== client.client_id || r.account_id == null || r.expires_ts < now())
+        throw new Error("invalid_grant");
+      if (redirectUri && redirectUri !== r.redirect_uri) throw new Error("invalid_grant");
       c.db.prepare("DELETE FROM oauth_codes WHERE code=?").run(authorizationCode);
       const access = "at-" + randHex(24);
       const refresh = "rt-" + randHex(24);
-      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,scope,expires_ts,created_ts) VALUES(?,?,?,?,?,?)")
+      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,kind,scope,expires_ts,created_ts) VALUES(?,?,?,'access',?,?,?)")
         .run(access, client.client_id, r.account_id, r.scope, iso(TOKEN_TTL_S), now());
-      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,scope,expires_ts,created_ts) VALUES(?,?,?,?,?,?)")
-        .run(refresh, client.client_id, r.account_id, r.scope, null, now());
+      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,kind,scope,expires_ts,created_ts) VALUES(?,?,?,'refresh',?,?,?)")
+        .run(refresh, client.client_id, r.account_id, r.scope, iso(REFRESH_TTL_S), now());
       return { access_token: access, token_type: "bearer", expires_in: TOKEN_TTL_S, refresh_token: refresh, scope: r.scope || undefined };
     },
 
     async exchangeRefreshToken(client, refreshToken, scopes): Promise<OAuthTokens> {
-      const r = c.db.prepare("SELECT * FROM oauth_tokens WHERE token=? AND client_id=?").get(refreshToken, client.client_id) as
+      const r = c.db.prepare("SELECT * FROM oauth_tokens WHERE token=? AND client_id=? AND kind='refresh'").get(refreshToken, client.client_id) as
         { account_id: number | null; scope: string; expires_ts: string | null } | undefined;
       if (!r || (r.expires_ts && r.expires_ts < now())) throw new Error("invalid_grant");
+      // scope may only narrow, never widen the original grant.
+      const granted = new Set(r.scope ? r.scope.split(" ") : []);
+      const requested = (scopes || []).filter((s) => granted.has(s));
+      const scope = requested.length ? requested.join(" ") : r.scope;
+      // rotate: the presented refresh token is consumed and replaced.
+      c.db.prepare("DELETE FROM oauth_tokens WHERE token=?").run(refreshToken);
       const access = "at-" + randHex(24);
-      const scope = (scopes || []).join(" ") || r.scope;
-      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,scope,expires_ts,created_ts) VALUES(?,?,?,?,?,?)")
+      const newRefresh = "rt-" + randHex(24);
+      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,kind,scope,expires_ts,created_ts) VALUES(?,?,?,'access',?,?,?)")
         .run(access, client.client_id, r.account_id, scope, iso(TOKEN_TTL_S), now());
-      return { access_token: access, token_type: "bearer", expires_in: TOKEN_TTL_S, scope: scope || undefined };
+      c.db.prepare("INSERT INTO oauth_tokens(token,client_id,account_id,kind,scope,expires_ts,created_ts) VALUES(?,?,?,'refresh',?,?,?)")
+        .run(newRefresh, client.client_id, r.account_id, scope, iso(REFRESH_TTL_S), now());
+      return { access_token: access, token_type: "bearer", expires_in: TOKEN_TTL_S, refresh_token: newRefresh, scope: scope || undefined };
     },
 
     async verifyAccessToken(token: string): Promise<AuthInfo> {
-      const r = c.db.prepare("SELECT * FROM oauth_tokens WHERE token=?").get(token) as
+      // ONLY access tokens authorize the data plane — a refresh token presented
+      // as a bearer must be rejected (finding 2).
+      const r = c.db.prepare("SELECT * FROM oauth_tokens WHERE token=? AND kind='access'").get(token) as
         { client_id: string; account_id: number | null; scope: string; expires_ts: string | null } | undefined;
-      if (!r || (r.expires_ts && r.expires_ts < now())) throw new Error("invalid_token");
+      if (!r || r.account_id == null || (r.expires_ts && r.expires_ts < now())) throw new Error("invalid_token");
       return { token, clientId: r.client_id, scopes: r.scope ? r.scope.split(" ") : [], expiresAt: r.expires_ts ? Math.floor(new Date(r.expires_ts).getTime() / 1000) : undefined, extra: { accountId: r.account_id } } as AuthInfo;
     },
 

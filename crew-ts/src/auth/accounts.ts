@@ -8,7 +8,7 @@ import type { Context } from "hono";
 import type { Ctx } from "../core/context.js";
 import { now } from "../db.js";
 
-interface Account { id: number; email: string; pw_hash: string; display: string }
+interface Account { id: number; email: string; pw_hash: string | null; display: string }
 
 export async function createAccount(c: Ctx, email: string, password: string, display = ""): Promise<{ ok: true; id: number } | { error: string }> {
   email = email.trim().toLowerCase();
@@ -22,7 +22,7 @@ export async function createAccount(c: Ctx, email: string, password: string, dis
 
 export async function verifyAccount(c: Ctx, email: string, password: string): Promise<number | null> {
   const a = c.db.prepare("SELECT * FROM accounts WHERE email=?").get(email.trim().toLowerCase()) as Account | undefined;
-  if (!a) return null;
+  if (!a || !a.pw_hash) return null; // no password set (e.g. GitHub-only account) → password login impossible
   try { return (await verify(a.pw_hash, password)) ? a.id : null; } catch { return null; }
 }
 
@@ -30,8 +30,9 @@ export function upsertGithubAccount(c: Ctx, ghLogin: string, ghId: number, displ
   const email = `gh_${ghId}@github`;
   const existing = c.db.prepare("SELECT id FROM accounts WHERE email=?").get(email) as { id: number } | undefined;
   if (existing) return existing.id;
-  const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,display,created_ts) VALUES(?,?,?,?)")
-    .run(email, "github", display || ghLogin, now());
+  // pw_hash NULL, never a guessable sentinel — password login is impossible for GitHub accounts.
+  const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,display,created_ts) VALUES(?,NULL,?,?)")
+    .run(email, display || ghLogin, now());
   return Number(info.lastInsertRowid);
 }
 
@@ -46,7 +47,8 @@ function sessionSecret(c: Ctx): string {
 }
 
 export async function setSession(c: Ctx, ctx: Context, accountId: number): Promise<void> {
-  const token = await sign({ sub: accountId, iat: Math.floor(Date.now() / 1000) }, sessionSecret(c));
+  const nowS = Math.floor(Date.now() / 1000);
+  const token = await sign({ sub: accountId, iat: nowS, exp: nowS + 60 * 60 * 24 * 30 }, sessionSecret(c));
   setCookie(ctx, "crew_session", token, { httpOnly: true, secure: c.cfg.mode !== "local", sameSite: "Lax", path: "/", maxAge: 60 * 60 * 24 * 30 });
 }
 

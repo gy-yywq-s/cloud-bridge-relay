@@ -8,7 +8,7 @@ import type { Ctx } from "../core/context.js";
 import { page, esc } from "../web/theme.js";
 import {
   createAccount, verifyAccount, upsertGithubAccount, setSession, getSession,
-  deployerPassword, github,
+  deployerPassword, github, clearSession,
 } from "./accounts.js";
 import { mintCode } from "./store.js";
 
@@ -101,6 +101,8 @@ export function authRoutes(c: Ctx): Hono {
       return ctx.text("GitHub authentication failed", 401);
     }
   });
+
+  app.get("/logout", (ctx) => { clearSession(ctx); return ctx.redirect("/login"); });
 
   return app;
 }

@@ -80,7 +80,7 @@ function migrate(db: DB): void {
     -- web accounts (cloud mode) + OAuth (authorization server state)
     CREATE TABLE IF NOT EXISTS accounts(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL, pw_hash TEXT,
       display TEXT NOT NULL DEFAULT '', created_ts TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS oauth_clients(
       client_id TEXT PRIMARY KEY, client_secret TEXT,
@@ -92,7 +92,13 @@ function migrate(db: DB): void {
       scope TEXT NOT NULL DEFAULT '', expires_ts TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS oauth_tokens(
       token TEXT PRIMARY KEY, client_id TEXT NOT NULL, account_id INTEGER,
+      kind TEXT NOT NULL DEFAULT 'access',
       scope TEXT NOT NULL DEFAULT '', expires_ts TEXT, created_ts TEXT NOT NULL);
+    -- pending (pre-login) authorizations live SEPARATELY from real codes so the
+    -- token endpoint can never consume one (security review finding 1).
+    CREATE TABLE IF NOT EXISTS oauth_pending(
+      pid TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+      code_challenge TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', expires_ts TEXT NOT NULL);
   `);
 }
 

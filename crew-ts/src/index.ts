@@ -35,6 +35,13 @@ process.on("uncaughtException", (err) => console.error("uncaughtException:", err
 
 if (cfg.mode !== "local" && !cfg.public_url)
   console.warn(`[crew] WARNING: mode='${cfg.mode}' needs public_url set for OAuth callbacks to work.`);
+// SAFETY INTERLOCK: cloud multi-tenant isolation is not implemented yet. Open
+// registration in cloud mode would let any stranger read every team's data, so
+// it is force-disabled until per-account scoping lands.
+if (cfg.mode === "cloud" && cfg.auth.open_registration) {
+  console.error("[crew] REFUSING open_registration in cloud mode: per-account data isolation is not yet implemented. Use mode='private' (single trust domain) for now. Open registration disabled.");
+  cfg.auth.open_registration = false;
+}
 
 const app = new Hono();
 // Cap request bodies before they are buffered/parsed into memory.
