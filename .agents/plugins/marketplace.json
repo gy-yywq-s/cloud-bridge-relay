@@ -1,0 +1,12 @@
+{
+  "name": "gaelis",
+  "interface": { "displayName": "Gaelis" },
+  "plugins": [
+    {
+      "name": "crew",
+      "source": { "source": "local", "path": "./plugins/codex/crew" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Productivity"
+    }
+  ]
+}

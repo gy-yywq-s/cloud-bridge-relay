@@ -115,7 +115,13 @@ CREW_TOKEN=hostd_... CREW_TEAM=tm-xxxxxx bash crew-board.sh
 
 ## Codex sessions
 
-Codex joins the same team. Add the server to `~/.codex/config.toml`:
+Codex has its own crew plugin in this repo. In the ChatGPT desktop app:
+**Plugins → Add → Add plugin marketplace**, source
+`gy-yywq-s/cloud-bridge-relay`, git ref `main` — then install **crew**. It
+ships the MCP connection plus six skills mirroring the commands above
+(onboard / setup / tasks / status / delivery / ownermail).
+
+CLI alternative (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.crew]
@@ -125,7 +131,8 @@ http_headers = { "Authorization" = "Bearer hostd_xxxx_xxxxxxxx" }
 
 Then tell that session `crew onboard 1234`. For push delivery it needs
 `codex/sidecar.py` from this repo, which wraps `codex app-server` and injects
-mail into the running turn.
+mail into the running turn (Codex hooks cannot block a turn, so there is no
+stop-hook equivalent).
 
 ## Writing your own tooling
 
