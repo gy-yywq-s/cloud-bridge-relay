@@ -1,128 +1,85 @@
 #!/usr/bin/env python3
-"""Mailbox relay for agent-to-agent messaging (email-style, multi-party).
+"""Mailbox relay v3: MCP server + REST, SQLite-persistent, email-style.
 
 Auth is enforced by the hostd gateway (auth: bearer); this process is
-loopback-only. Stdlib only — no dependencies.
+loopback-only.
 
-Concepts:
-  - A *box* is a named mailbox, auto-created on first use. Names: [a-z0-9-_]{1,32}.
-  - A message is addressed to one or more boxes via `to` (primary recipients)
-    and optionally `cc` (carbon copies). Every recipient gets the same
-    envelope, which shows the full addressing — exactly like email headers.
-  - `from` is the sender's stable box name (reply address). `alias` is a
-    display name attached per message; senders may change it any time and
-    the new name simply shows up on subsequent messages.
+Two ways in, same mailboxes:
+  MCP (Streamable HTTP, endpoint /mcp): tools send_mail / check_mail /
+      peek_mail / list_boxes — any MCP client discovers these natively.
+  REST (unchanged from v2): GET /, /health, /poll, /peek, /boxes, POST /send.
 
-Endpoints:
-  GET  /                 this documentation (self-describing; start here)
-  GET  /health           liveness (used by the platform probe)
-  POST /send             JSON {from, alias?, to, cc?, body}; `to`/`cc` are a
-                         box name or list of box names
-  GET  /poll?box=X&wait=N   long-poll X's mailbox; drains and returns messages
-  GET  /peek?box=X       look without taking
-  GET  /boxes            active boxes with pending counts
-
-Envelope: {"id": n, "ts": iso8601, "from": box, "alias": str, "to": [...],
-           "cc": [...], "body": str}
-
-Long-poll wait defaults to 25s, capped at 55s.
+Semantics:
+  - A *box* is a named mailbox, auto-created on first use: [a-z0-9][a-z0-9_-]{0,31}
+  - `from` = sender's stable box name (machines reply to and identify by it).
+  - `alias` = sender's CURRENT SESSION NAME, attached per message, display
+    only. Senders keep it in sync with their session title; never route by it.
+  - `to` (act) and `cc` (FYI) — every recipient sees full addressing, plus
+    `delivered_as`: "to" | "cc" so a cc copy is distinguishable at a glance.
+  - Messages persist in SQLite under $HOSTD_DATA_DIR: a redeploy no longer
+    loses queued mail. Delivered (drained) messages are kept, flagged, and
+    pruned after PRUNE_DAYS.
 """
+import asyncio
 import json
 import os
 import re
-import sys
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
 
-# Auth happens at the hostd gateway (auth: bearer); this process is loopback-only.
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
 PORT = int(os.environ.get("PORT", os.environ.get("RELAY_PORT", "8790")))
-HOST = "127.0.0.1" if os.environ.get("PORT") else "0.0.0.0"
+DATA_DIR = Path(os.environ.get("HOSTD_DATA_DIR", str(Path.home() / ".relay_data")))
+DB = DATA_DIR / "relay.db"
 MAX_BODY = 256 * 1024
-MAX_QUEUE = 500
-MAX_BOXES = 200
+MAX_WAIT = 55
+PRUNE_DAYS = 14
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
-USAGE = {
-    "service": "cloud-bridge-relay",
-    "detail": ("Email-style mailbox relay between agent sessions. A box is a "
-               "named mailbox, auto-created on first use. Address a message "
-               "to one or more boxes with `to`, copy others with `cc`. Poll "
-               "your own box to receive. Identity has two layers: `from` is "
-               "your stable box name — machines use it to reply and to "
-               "identify you; `alias` is your SESSION NAME, attached to every "
-               "message purely for the human reading the traffic. Session "
-               "names get renamed mid-flight, so send your current one each "
-               "time — never cache another sender's alias, and never route "
-               "by it."),
-    "endpoints": {
-        "GET /": "this document",
-        "POST /send": ("JSON {from, alias?, to, cc?, body}. `to`/`cc`: box "
-                       "name or list. Delivers one envelope to every "
-                       "recipient's box."),
-        "GET /poll?box=X&wait=N": ("long-poll box X (N<=55s, default 25); "
-                                   "returns {messages:[...]} and removes them"),
-        "GET /peek?box=X": "like poll but non-destructive and no wait",
-        "GET /boxes": "active boxes with pending message counts",
-    },
-    "envelope": {"id": "int", "ts": "iso8601", "from": "sender box (stable id; reply here)",
-                 "alias": "sender's current session name (display only)",
-                 "to": ["boxes"], "cc": ["boxes"], "body": "string"},
-    "example": ('curl -s -X POST .../send -H "Authorization: Bearer $CRED" '
-                '-H "Content-Type: application/json" -d \'{"from":"manager",'
-                '"alias":"MWG manager","to":"mac","body":"hello"}\''),
-    "box_name_rule": "[a-z0-9][a-z0-9_-]{0,31}",
-}
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+_local = threading.local()
 
 
-class Box:
-    def __init__(self):
-        self.items = []
-        self.cond = threading.Condition()
-
-    def push(self, env):
-        with self.cond:
-            if len(self.items) >= MAX_QUEUE:
-                self.items.pop(0)
-            self.items.append(env)
-            self.cond.notify_all()
-
-    def drain(self, wait_s):
-        deadline = time.monotonic() + wait_s
-        with self.cond:
-            while not self.items:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return []
-                self.cond.wait(remaining)
-            out, self.items = self.items, []
-            return out
-
-    def peek(self):
-        with self.cond:
-            return list(self.items)
+def db() -> sqlite3.Connection:
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = _local.conn = sqlite3.connect(DB)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.row_factory = sqlite3.Row
+    return conn
 
 
-boxes: dict = {}
-boxes_lock = threading.Lock()
-id_lock = threading.Lock()
-next_id = 1
+def init_db():
+    c = sqlite3.connect(DB)
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS messages(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL, sender TEXT NOT NULL, alias TEXT NOT NULL,
+      to_json TEXT NOT NULL, cc_json TEXT NOT NULL, body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS deliveries(
+      msg_id INTEGER NOT NULL REFERENCES messages(id),
+      recipient TEXT NOT NULL, delivered_as TEXT NOT NULL,
+      taken_ts TEXT, PRIMARY KEY (msg_id, recipient));
+    CREATE INDEX IF NOT EXISTS idx_deliv_pending
+      ON deliveries(recipient) WHERE taken_ts IS NULL;
+    """)
+    c.commit()
+    c.close()
 
 
-def get_box(name, create=True):
-    with boxes_lock:
-        b = boxes.get(name)
-        if b is None and create:
-            if len(boxes) >= MAX_BOXES:
-                return None
-            b = boxes[name] = Box()
-        return b
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def as_box_list(v):
-    """Normalize a box-name-or-list into a validated list, or None on error."""
     if v is None:
         return []
     if isinstance(v, str):
@@ -131,108 +88,213 @@ def as_box_list(v):
         return None
     if any(not BOX_RE.match(x) for x in v):
         return None
-    return list(dict.fromkeys(v))  # dedupe, keep order
+    return list(dict.fromkeys(v))
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+def envelope(row, drow):
+    return {"id": row["id"], "ts": row["ts"], "from": row["sender"],
+            "alias": row["alias"], "to": json.loads(row["to_json"]),
+            "cc": json.loads(row["cc_json"]), "delivered_as": drow["delivered_as"],
+            "body": row["body"]}
 
-    def _send(self, code, obj):
-        data = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
-    def _query(self):
-        return parse_qs(urlparse(self.path).query)
+def do_send(sender, alias, to, cc, body):
+    if not isinstance(sender, str) or not BOX_RE.match(sender):
+        return None, {"error": "bad_from", "detail": BOX_RE.pattern}
+    to, cc = as_box_list(to), as_box_list(cc)
+    if to is None or cc is None or not to:
+        return None, {"error": "bad_recipients",
+                      "detail": "`to` required; `to`/`cc` are a box name or list"}
+    if not isinstance(body, str) or not body.strip():
+        return None, {"error": "empty_body"}
+    if len(body) > MAX_BODY:
+        return None, {"error": "body_too_large"}
+    cc = [c for c in cc if c not in to]
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO messages(ts,sender,alias,to_json,cc_json,body) VALUES(?,?,?,?,?,?)",
+        (now(), sender, str(alias)[:200], json.dumps(to), json.dumps(cc), body))
+    mid = cur.lastrowid
+    for r in to:
+        conn.execute("INSERT INTO deliveries(msg_id,recipient,delivered_as) VALUES(?,?,?)",
+                     (mid, r, "to"))
+    for r in cc:
+        conn.execute("INSERT INTO deliveries(msg_id,recipient,delivered_as) VALUES(?,?,?)",
+                     (mid, r, "cc"))
+    conn.execute("DELETE FROM messages WHERE ts < datetime('now', ?) AND id IN "
+                 "(SELECT msg_id FROM deliveries GROUP BY msg_id "
+                 " HAVING count(*) = count(taken_ts))", (f"-{PRUNE_DAYS} days",))
+    conn.commit()
+    return {"ok": True, "id": mid, "delivered_to": to + cc}, None
 
-    def _wait_param(self, q):
-        try:
-            return min(max(int(q.get("wait", ["25"])[0]), 0), 55)
-        except ValueError:
-            return 25
 
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/":
-            return self._send(200, USAGE)
-        if path == "/health":
-            return self._send(200, {"ok": True})
-        if path in ("/poll", "/peek"):
-            q = self._query()
-            name = q.get("box", [""])[0]
-            if not BOX_RE.match(name):
-                return self._send(400, {"error": "bad_box",
-                                        "detail": USAGE["box_name_rule"]})
-            b = get_box(name)
-            if b is None:
-                return self._send(507, {"error": "too_many_boxes"})
-            if path == "/poll":
-                return self._send(200, {"messages": b.drain(self._wait_param(q))})
-            return self._send(200, {"messages": b.peek()})
-        if path == "/boxes":
-            with boxes_lock:
-                stats = {n: len(b.items) for n, b in sorted(boxes.items())}
-            return self._send(200, {"boxes": stats})
-        return self._send(404, {"error": "not_found", "detail": "GET / lists endpoints"})
+def fetch_box(box, take: bool):
+    conn = db()
+    rows = conn.execute(
+        "SELECT m.*, d.delivered_as FROM deliveries d JOIN messages m ON m.id=d.msg_id "
+        "WHERE d.recipient=? AND d.taken_ts IS NULL ORDER BY m.id", (box,)).fetchall()
+    out = [envelope(r, r) for r in rows]
+    if take and rows:
+        conn.executemany(
+            "UPDATE deliveries SET taken_ts=? WHERE msg_id=? AND recipient=?",
+            [(now(), r["id"], box) for r in rows])
+        conn.commit()
+    return out
 
-    def do_POST(self):
-        global next_id
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > MAX_BODY:
-            self.close_connection = True
-            return self._send(413, {"error": "body_too_large"})
-        raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        if path != "/send":
-            return self._send(404, {"error": "not_found", "detail": "POST /send only"})
-        try:
-            msg = json.loads(raw)
-            assert isinstance(msg, dict)
-        except Exception:
-            return self._send(400, {"error": "bad_json",
-                                    "detail": "body must be a JSON object; GET / for the shape"})
-        sender = msg.get("from", "")
-        if not isinstance(sender, str) or not BOX_RE.match(sender):
-            return self._send(400, {"error": "bad_from", "detail": USAGE["box_name_rule"]})
-        to = as_box_list(msg.get("to"))
-        cc = as_box_list(msg.get("cc"))
-        if to is None or cc is None or not to:
-            return self._send(400, {"error": "bad_recipients",
-                                    "detail": "`to` required; `to`/`cc` are a box name or list"})
-        body = msg.get("body", "")
-        if not isinstance(body, str) or not body.strip():
-            return self._send(400, {"error": "empty_body"})
-        alias = msg.get("alias", "")
-        if not isinstance(alias, str):
-            alias = str(alias)
-        with id_lock:
-            mid = next_id
-            next_id += 1
-        env = {
-            "id": mid,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "from": sender,
-            "alias": alias[:200],
-            "to": to,
-            "cc": [c for c in cc if c not in to],
-            "body": body,
+
+async def do_poll(box, wait_s: int):
+    deadline = time.monotonic() + min(max(wait_s, 0), MAX_WAIT)
+    while True:
+        msgs = fetch_box(box, take=True)
+        if msgs or time.monotonic() >= deadline:
+            return msgs
+        await asyncio.sleep(1.0)
+
+
+def do_boxes():
+    conn = db()
+    rows = conn.execute("""
+      SELECT box, MAX(last_seen) AS last_seen, SUM(pending) AS pending,
+             MAX(CASE WHEN alias!='' THEN last_seen END) IS NOT NULL AS has_alias
+      FROM (
+        SELECT sender AS box, ts AS last_seen, 0 AS pending, alias FROM messages
+        UNION ALL
+        SELECT recipient, NULL, CASE WHEN taken_ts IS NULL THEN 1 ELSE 0 END, ''
+        FROM deliveries
+      ) GROUP BY box ORDER BY box""").fetchall()
+    result = {}
+    for r in rows:
+        alias_row = conn.execute(
+            "SELECT alias FROM messages WHERE sender=? ORDER BY id DESC LIMIT 1",
+            (r["box"],)).fetchone()
+        result[r["box"]] = {
+            "pending": int(r["pending"] or 0),
+            "last_alias": alias_row["alias"] if alias_row else None,
+            "last_sent": r["last_seen"],
         }
-        recipients = env["to"] + env["cc"]
-        for name in recipients:
-            b = get_box(name)
-            if b is None:
-                return self._send(507, {"error": "too_many_boxes"})
-            b.push(env)
-        return self._send(200, {"ok": True, "id": mid, "delivered_to": recipients})
+    return result
 
-    def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+USAGE = {
+    "service": "cloud-bridge-relay",
+    "v": 3,
+    "detail": ("Email-style mailbox relay between agent sessions, reachable as "
+               "an MCP server (Streamable HTTP at /mcp — tools are "
+               "self-describing: send_mail, check_mail, peek_mail, list_boxes) "
+               "or as plain REST (endpoints below). Identity: `from` is your "
+               "stable box name — machines reply to it and identify by it. "
+               "`alias` is your CURRENT SESSION NAME, display only, attached "
+               "per message; keep it in sync with your session title, never "
+               "cache another sender's alias, never route by it. `to` = act, "
+               "`cc` = FYI; each copy carries delivered_as so cc is "
+               "distinguishable. Messages persist across redeploys (SQLite)."),
+    "mcp": {"endpoint": "/mcp", "transport": "streamable-http",
+            "auth": "same Authorization: Bearer header"},
+    "endpoints": {
+        "GET /": "this document",
+        "POST /send": "JSON {from, alias?, to, cc?, body}; to/cc: box name or list",
+        "GET /poll?box=X&wait=N": "long-poll (N<=55), returns+takes messages",
+        "GET /peek?box=X": "look without taking",
+        "GET /boxes": "directory: pending count, last_alias, last_sent per box",
+    },
+    "box_name_rule": BOX_RE.pattern,
+}
+
+mcp = FastMCP("cloud-bridge-relay", stateless_http=True, json_response=True)
+
+
+@mcp.tool()
+async def send_mail(sender_box: str, session_name: str, to: list[str],
+                    body: str, cc: list[str] | None = None) -> dict:
+    """Send a message to one or more mailboxes (email-style).
+
+    sender_box: your stable box name (recipients reply here).
+    session_name: your session's current display name, shown to the human
+    reading the traffic — pass your live title every time.
+    to: box names that should act; cc: boxes copied for information only.
+    """
+    res, err = do_send(sender_box, session_name, to, cc or [], body)
+    return res if res else err
+
+
+@mcp.tool()
+async def check_mail(box: str, wait_seconds: int = 25) -> list[dict]:
+    """Long-poll your mailbox: returns pending messages and removes them.
+
+    Each message shows from/alias/to/cc and delivered_as ("to" = act,
+    "cc" = FYI copy). wait_seconds is capped at 55.
+    """
+    if not BOX_RE.match(box):
+        return [{"error": "bad_box"}]
+    return await do_poll(box, wait_seconds)
+
+
+@mcp.tool()
+async def peek_mail(box: str) -> list[dict]:
+    """Look at pending messages in a box without removing them."""
+    if not BOX_RE.match(box):
+        return [{"error": "bad_box"}]
+    return fetch_box(box, take=False)
+
+
+@mcp.tool()
+async def list_boxes() -> dict:
+    """Directory of active boxes: pending count, last seen alias, last send time."""
+    return do_boxes()
+
+
+async def rest_root(_):
+    return JSONResponse(USAGE)
+
+
+async def rest_health(_):
+    return JSONResponse({"ok": True})
+
+
+async def rest_send(req: Request):
+    try:
+        msg = json.loads(await req.body())
+        assert isinstance(msg, dict)
+    except Exception:
+        return JSONResponse({"error": "bad_json"}, status_code=400)
+    res, err = do_send(msg.get("from", ""), msg.get("alias", ""),
+                       msg.get("to"), msg.get("cc"), msg.get("body", ""))
+    return JSONResponse(res if res else err, status_code=200 if res else 400)
+
+
+async def rest_poll(req: Request):
+    box = req.query_params.get("box", "")
+    if not BOX_RE.match(box):
+        return JSONResponse({"error": "bad_box"}, status_code=400)
+    try:
+        wait = int(req.query_params.get("wait", "25"))
+    except ValueError:
+        wait = 25
+    return JSONResponse({"messages": await do_poll(box, wait)})
+
+
+async def rest_peek(req: Request):
+    box = req.query_params.get("box", "")
+    if not BOX_RE.match(box):
+        return JSONResponse({"error": "bad_box"}, status_code=400)
+    return JSONResponse({"messages": fetch_box(box, take=False)})
+
+
+async def rest_boxes(_):
+    return JSONResponse({"boxes": do_boxes()})
+
+
+init_db()
+app = mcp.streamable_http_app()
+app.router.routes.extend([
+    Route("/", rest_root),
+    Route("/health", rest_health),
+    Route("/send", rest_send, methods=["POST"]),
+    Route("/poll", rest_poll),
+    Route("/peek", rest_peek),
+    Route("/boxes", rest_boxes),
+])
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"relay v2 listening on {HOST}:{PORT}", flush=True)
-    server.serve_forever()
+    uvicorn.run(app, host="127.0.0.1" if os.environ.get("PORT") else "0.0.0.0",
+                port=PORT, log_level="info")
