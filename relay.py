@@ -175,6 +175,7 @@ def init_db():
                            ("messages", "reply_to", "INTEGER"),
                            ("boxes", "stale", "INTEGER NOT NULL DEFAULT 0"),
                            ("teams", "rv", "INTEGER NOT NULL DEFAULT 1"),
+                           ("teams", "view_key", "TEXT"),
                            ("boxes", "seen_rv", "INTEGER NOT NULL DEFAULT 0"),
                            ("deliveries", "email_status", "TEXT"),
                            ("teams", "pool_code", "TEXT NOT NULL DEFAULT ''")]:
@@ -710,6 +711,35 @@ def fetch_box(box, take: bool):
     return out
 
 
+def board_reminder(box):
+    """Harness-style ephemeral nudge: hold no task + board has ready work."""
+    b = box_row(box)
+    if not (b and b["team_code"]):
+        return None
+    holds = db().execute("SELECT count(*) n FROM tasks WHERE owner=? AND "
+                         "status='claimed'", (box,)).fetchone()["n"]
+    if holds:
+        return None
+    ready = [t for t in db().execute(
+        "SELECT * FROM tasks WHERE team=? AND status='open' "
+        "ORDER BY priority, id", (b["team_code"],))
+        if task_deps_done(t) and (not t["owner"] or t["owner"] == box)]
+    if not ready:
+        return None
+    return {
+        "id": 0, "kind": "system", "ephemeral": True,
+        "from": {"box": "relay", "display_name": "relay", "platform": "relay",
+                 "member_no": None, "team": b["team_code"], "role": "",
+                 "is_human": False},
+        "to": [box], "cc": [], "delivered_as": "to",
+        "directive": DIRECTIVES["system"],
+        "body": ("BOARD REMINDER: you hold no task and the board has "
+                 f"{len(ready)} ready (first: #{ready[0]['id']} "
+                 f"\"{ready[0]['title']}\"). If nothing in this mail changes "
+                 "your priorities, task_claim one now instead of going idle. "
+                 "Do not ack this reminder — it is not stored.")}
+
+
 async def do_poll(box, wait_s: int, take: bool):
     """take=True: legacy auto-take. take=False: ack model — messages stay
     pending until do_ack; replays return the same ids."""
@@ -920,8 +950,10 @@ def do_initialize_team(pool_code, coordinator_box):
     waiting = conn.execute(
         "SELECT * FROM boxes WHERE status='waiting' AND pool_code=? "
         "ORDER BY created_ts", (pool_code,)).fetchall()
-    conn.execute("INSERT INTO teams(code,name,pool_code,coordinator,created_ts) "
-                 "VALUES(?,?,?,?,?)", (code, "", pool_code, coordinator_box, now()))
+    conn.execute("INSERT INTO teams(code,name,pool_code,coordinator,created_ts,"
+                 "view_key) VALUES(?,?,?,?,?,?)",
+                 (code, "", pool_code, coordinator_box, now(),
+                  secrets.token_hex(3)))
     ordered = ([b for b in waiting if b["box"] == coordinator_box] +
                [b for b in waiting if b["box"] != coordinator_box])
     for i, b in enumerate(ordered, start=1):
@@ -935,7 +967,13 @@ def do_initialize_team(pool_code, coordinator_box):
                     f"TEAM FORMED from pool {pool_code}. You are member #{i} of "
                     f"team {code} ({len(ordered)} members; coordinator: "
                     f"{coordinator_box}). KEEP POLLING your box; setup notices "
-                    f"will follow. Use list_team('{code}') for the roster.")
+                    f"will follow. Use list_team('{code}') for the roster. "
+                    "BOARD DISCIPLINE from now on: shared work lives on the "
+                    "team task board (task_add / task_claim / task_progress / "
+                    "task_done), handoff mail auto-files tasks, discovered "
+                    "work gets filed not chased, and when you hold no task "
+                    "you claim a ready one before going idle. Private todo "
+                    "tools are only for micro-steps inside your claimed task.")
     wiz_save(code, "", {}, 0)
     return {"ok": True, **team_roster(code),
             "directive": ("TEAM CREATED AND YOU ARE THE COORDINATOR (member #1). "
@@ -1096,6 +1134,27 @@ def do_thread(mid, limit=50):
                     "body": r["body"]})
     return {"root": out[0]["id"] if out else None, "messages": out}
 
+
+
+
+def team_view_key(code):
+    """Per-team 6-char read key for the human board site. Generated lazily
+    for teams that predate the feature."""
+    t = db().execute("SELECT view_key FROM teams WHERE code=?", (code,)).fetchone()
+    if not t:
+        return None
+    if t["view_key"]:
+        return t["view_key"]
+    k = secrets.token_hex(3)
+    db().execute("UPDATE teams SET view_key=? WHERE code=?", (k, code))
+    db().commit()
+    return k
+
+
+def resolve_view_key(key):
+    r = db().execute("SELECT code FROM teams WHERE view_key=?",
+                     (str(key).strip().lower(),)).fetchone()
+    return r["code"] if r else None
 
 
 def team_manager_box(code):
@@ -1268,6 +1327,14 @@ def do_task_add(team, title, detail, created_by, deps=None, assign_to="",
         if not a or a["team_code"] != team:
             return {"error": "bad_assignee",
                     "detail": "assign_to must be a member box of this team"}
+        cb = box_row(created_by)
+        if (cb and cb["role"] == "worker" and assign_to != created_by):
+            return {"error": "chain_of_command",
+                    "directive": ("HARD RULE: workers do not assign work to "
+                                  "others. Add the task unassigned (anyone "
+                                  "claims), reserve it for yourself, or send "
+                                  "a `question` to your MANAGER proposing the "
+                                  "assignment.")}
     try:
         priority = int(priority)
         assert priority in (1, 2, 3)
@@ -1325,11 +1392,13 @@ def do_task_claim(tid, box):
                 "directive": "Someone beat you to it; pick another ready task."}
     return {"ok": True, "task_id": tid, "title": t["title"],
             "detail": t["detail"],
-            "directive": ("Task claimed. Work it; call task_progress with a "
-                          "one-line note at least every hour so it never "
-                          "shows as stalled, and task_done(result=...) the "
-                          "moment it is finished — unfinished-looking done "
-                          "work is the #1 way agent teams jam.")}
+            "directive": ("Task claimed. Break it into micro-steps with your "
+                          "session's own todo tools if you like — but the "
+                          "board holds only THIS shared unit. task_progress "
+                          "a one-line note at least hourly so it never shows "
+                          "stalled, and task_done(result=...) the moment it "
+                          "is finished — a forgotten close is the #1 way "
+                          "agent teams jam.")}
 
 
 def do_task_progress(tid, box, note):
@@ -1913,6 +1982,8 @@ def wiz_next(code, restart=False):
     return {"done": True, "summary": roster_text(code),
             "answers": answers,
             "say_to_owner": ("Setup complete. Here is your crew:\n\n" + roster_text(code) +
+                             f"\n\nLive board: https://board.gaelis.cc — view key: "
+                             f"{team_view_key(code)} (read-only, keep it semi-private)." +
                              "\n\nEveryone has been notified. Say \"crew "
                              "setup " + code + " restart\" to redo this "
                              "interview, or name a single change any time."),
@@ -1959,10 +2030,10 @@ def wiz_guard(code):
 
 CLIENT_PY = r'''"""crew client — one import instead of ten hand-rolled HTTP calls.
 
-    curl -sO https://relay.gaelis.cc/client/python && mv python crew_client.py
+    curl -sO https://crew.gaelis.cc/client/python && mv python crew_client.py
 
     from crew_client import Crew
-    crew = Crew("https://relay.gaelis.cc", "hostd_...")      # your credential
+    crew = Crew("https://crew.gaelis.cc", "hostd_...")      # your credential
     me = crew.register(platform="codex", environment="mac / local",
                        pool_code="1234", session_name="Nova")
     for msg in crew.inbox(wait=50):        # yields mail, acks after each one
@@ -2097,10 +2168,10 @@ h1{{font-size:20px}}</style>
 BOARD_SH = r'''#!/usr/bin/env bash
 # crew live task board in your terminal. Refreshes every 5s.
 #   export CREW_TOKEN=hostd_...   CREW_TEAM=tm-xxxxxx
-#   curl -s https://relay.gaelis.cc/client/board -o crew-board.sh && bash crew-board.sh
+#   curl -s https://crew.gaelis.cc/client/board -o crew-board.sh && bash crew-board.sh
 set -u
 : "${CREW_TOKEN:?export CREW_TOKEN first}" "${CREW_TEAM:?export CREW_TEAM first}"
-CREW_URL="${CREW_URL:-https://relay.gaelis.cc}"
+CREW_URL="${CREW_URL:-https://crew.gaelis.cc}"
 while true; do
   OUT=$(curl -s -A crew-board -H "Authorization: Bearer $CREW_TOKEN" \
     "$CREW_URL/tasks?team=$CREW_TEAM" 2>/dev/null)
@@ -2150,6 +2221,20 @@ USAGE = {
                "card footer."),
     "mcp": {"endpoint": "/mcp", "transport": "streamable-http",
             "prompts": ["onboard", "setup", "add-owner-mailbox", "team-status"]},
+    "board_discipline": (
+        "The task board is agent-facing coordination, like a harness todo "
+        "list extended to the whole team — the human is never required to "
+        "plan. Rules every member follows: (1) any unit of work that "
+        "outlives your turn goes on the board; (2) hand work over with a "
+        "handoff mail, which auto-files a reserved task; (3) file discovered "
+        "work with task_add(discovered_from=...) instead of chasing it; (4) "
+        "hold-none-claim-one: before going idle, claim a ready task if you "
+        "hold none (check_mail reminds you); (5) heartbeat your claimed task "
+        "with task_progress, close it with task_done the moment it is done; "
+        "(6) your session's private todo tools are for micro-steps inside "
+        "your claimed task only — the board is the single source of truth "
+        "for shared work. HARD-CODED: atomic claims; only claimer/manager "
+        "close; workers cannot assign tasks to others."),
     "flow_is_enforced": ("Team configuration runs as a server-driven interview: setup_next gives one question at a time with the exact wording to read to the owner, setup_answer applies it. The direct setters are refused until that interview completes, so no session can improvise setup. Mail is templated (status/milestone/blocker/question/handoff/result/note) and missing required fields are refused."),
     "delivery": {
         "how_you_receive_depends_on_how_you_were_STARTED": (
@@ -2213,6 +2298,7 @@ USAGE = {
         "GET /thread?id=N": "whole conversation chain around one message",
         "GET /audit?box=X": "human-readable audit page (open in a browser)",
         "GET /tasks?team=X": "task board JSON (tasks + rendered board + roster)",
+        "GET /viewkey?key=K": "resolve a board view key to its team (board site uses this)",
         "POST /task/add|claim|progress|done": "task board mirror of the MCP tools",
         "GET /board?team=X": "auto-refreshing board page",
         "GET /client/board": "terminal live-board script (CREW_TOKEN+CREW_TEAM)",
@@ -2220,16 +2306,16 @@ USAGE = {
     "box_name_rule": BOX_RE.pattern,
 }
 
-# Behind the hostd gateway the public Host is relay.gaelis.cc; the SDK's
+# Behind the hostd gateway the public Host is crew.gaelis.cc; the SDK's
 # DNS-rebinding protection defaults to localhost-only and answers 421 to
 # everything else, so list the real hosts explicitly.
 mcp = FastMCP(
     "crew", stateless_http=True, json_response=True,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=["relay.gaelis.cc", "localhost", "127.0.0.1",
+        allowed_hosts=["crew.gaelis.cc", "localhost", "127.0.0.1",
                        "localhost:*", "127.0.0.1:*"],
-        allowed_origins=["https://relay.gaelis.cc", "https://claude.ai",
+        allowed_origins=["https://crew.gaelis.cc", "https://claude.ai",
                          "https://claude.com"]))
 
 
@@ -2255,7 +2341,16 @@ def prompt_onboard() -> str:
         "(status/milestone/blocker/question/handoff/result/note) — free-form "
         "prose is refused. If you can run code, curl <relay>/client/python "
         "for a ready client with an ack-safe inbox loop.\n"
-        "5. Obey the directive on every message: ACTION = act and reply, "
+        "5. BOARD DISCIPLINE (the team task board is yours, not the "
+        "human's — they never have to plan for you): any unit of work that "
+        "outlives your current turn belongs on the board. Hand work to a "
+        "teammate with a `handoff` mail (it auto-files a task); file work "
+        "you DISCOVER with task_add(discovered_from=...) instead of chasing "
+        "it; before going idle, check_mail then task_claim a ready task if "
+        "you hold none (check_mail reminds you). Your session's own private "
+        "todo tools are for micro-steps INSIDE your claimed task only — the "
+        "board is the single source of truth for shared work.\n"
+        "6. Obey the directive on every message: ACTION = act and reply, "
         "THIS IS A CC = read only, SYSTEM NOTICE = follow, never reply."
     )
 
@@ -2560,7 +2655,11 @@ async def check_mail(box: str, wait_seconds: int = 25,
         return [{"error": "bad_box"}]
     if ack_through:
         do_ack(box, ack_through)
-    return await do_poll(box, wait_seconds, take=False)
+    msgs = await do_poll(box, wait_seconds, take=False)
+    rem = board_reminder(box)
+    if rem:
+        msgs.append(rem)
+    return msgs
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -2657,6 +2756,21 @@ async def task_list(team: str) -> dict:
     if not db().execute("SELECT 1 FROM teams WHERE code=?", (str(team),)).fetchone():
         return {"error": "no_such_team"}
     return {"say_to_owner": board_text(str(team)), "relay_rule": RELAY_RULE}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def board_key(team: str) -> dict:
+    """The team's read-only view key for the human board site
+    (https://board.gaelis.cc). Give it to the human when they ask how to
+    watch the board in a browser; it grants VIEW ONLY of this one team."""
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (str(team),)).fetchone():
+        return {"error": "no_such_team"}
+    k = team_view_key(str(team))
+    return {"team": str(team), "view_key": k,
+            "say_to_owner": ("Live board: https://board.gaelis.cc — enter key "
+                             + k + ". Read-only, this team only; keep it "
+                             "semi-private."),
+            "relay_rule": RELAY_RULE}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -2847,7 +2961,11 @@ async def _r_checkmail(req, _p):
         ack_through = 0
     if ack_through:
         do_ack(box, ack_through)
-    return {"messages": await do_poll(box, wait, take=False)}
+    msgs = await do_poll(box, wait, take=False)
+    rem = board_reminder(box)
+    if rem:
+        msgs.append(rem)
+    return {"messages": msgs}
 
 
 async def _r_ack(_req, p):
@@ -2882,6 +3000,13 @@ async def _r_audit(req):
     except ValueError:
         limit = 200
     return HTMLResponse(audit_html(box, min(max(limit, 1), 500)))
+
+
+async def _r_viewkey(req, _p):
+    code = resolve_view_key(req.query_params.get("key", ""))
+    if not code:
+        return {"error": "bad_key"}
+    return {"team": code}
 
 
 async def _r_tasks(req, _p):
@@ -2968,6 +3093,7 @@ app.router.routes.extend([
     Route("/history", _json_route(_r_history)),
     Route("/thread", _json_route(_r_thread)),
     Route("/audit", _r_audit),
+    Route("/viewkey", _json_route(_r_viewkey)),
     Route("/tasks", _json_route(_r_tasks)),
     Route("/task/add", _json_route(_r_task_add), methods=["POST"]),
     Route("/task/claim", _json_route(_r_task_claim), methods=["POST"]),

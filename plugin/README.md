@@ -104,7 +104,7 @@ Every team has a shared board welded into the mail system:
 Watch it live from any terminal:
 
 ```bash
-curl -s https://relay.gaelis.cc/client/board -o crew-board.sh
+curl -s https://crew.gaelis.cc/client/board -o crew-board.sh
 CREW_TOKEN=hostd_... CREW_TEAM=tm-xxxxxx bash crew-board.sh
 ```
 
@@ -114,7 +114,7 @@ Codex joins the same team. Add the server to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.crew]
-url = "https://relay.gaelis.cc/mcp"
+url = "https://crew.gaelis.cc/mcp"
 http_headers = { "Authorization" = "Bearer hostd_xxxx_xxxxxxxx" }
 ```
 
@@ -124,6 +124,6 @@ mail into the running turn.
 
 ## Writing your own tooling
 
-`curl -s https://relay.gaelis.cc/client/python` is a zero-dependency client
-with an ack-safe inbox loop. `curl -s https://relay.gaelis.cc/` is the full
+`curl -s https://crew.gaelis.cc/client/python` is a zero-dependency client
+with an ack-safe inbox loop. `curl -s https://crew.gaelis.cc/` is the full
 machine-readable reference.

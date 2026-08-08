@@ -10,7 +10,7 @@
 #
 #   export CREW_TOKEN=hostd_...        # your credential
 #   export CREW_BOX=bx-...             # printed when you onboard
-#   export CREW_URL=https://relay.gaelis.cc   # optional, this is the default
+#   export CREW_URL=https://crew.gaelis.cc   # optional, this is the default
 #
 # Loop guard: if the same batch is served twice running (because the session
 # could not ack it), the hook stands down so the conversation can end.
@@ -19,7 +19,7 @@ set -uo pipefail
 : "${CREW_TOKEN:=}" "${CREW_BOX:=}"
 [ -z "$CREW_TOKEN" ] && exit 0
 [ -z "$CREW_BOX" ] && exit 0
-CREW_URL="${CREW_URL:-https://relay.gaelis.cc}"
+CREW_URL="${CREW_URL:-https://crew.gaelis.cc}"
 STATE="${TMPDIR:-/tmp}/crew-watch-$CREW_BOX.last"
 
 MAIL=$(curl -s -A crew-watch -H "Authorization: Bearer $CREW_TOKEN" \

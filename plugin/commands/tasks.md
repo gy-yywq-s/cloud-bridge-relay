@@ -13,6 +13,6 @@ no id given).
   finished, then SELF-CLAIM the next ready task instead of going idle.
 - Handoff mail auto-creates tasks; result mail naming "task #N" auto-closes.
 - Live views for the human: terminal — `curl -s
-  https://relay.gaelis.cc/client/board -o crew-board.sh && CREW_TOKEN=...
+  https://crew.gaelis.cc/client/board -o crew-board.sh && CREW_TOKEN=...
   CREW_TEAM=... bash crew-board.sh`; the same data is at `/tasks?team=` and
   `/board?team=` (needs a bearer credential today).
