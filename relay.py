@@ -1001,36 +1001,42 @@ USAGE = {
                "card footer."),
     "mcp": {"endpoint": "/mcp", "transport": "streamable-http",
             "prompts": ["onboard", "setup", "add-owner-mailbox", "team-status"]},
-    "listening": {
-        "mode_1_polling": (
-            "Works everywhere, no extras. Loop: check_mail(box, "
-            "wait_seconds=50) -> process every message -> ack_mail(box, "
-            "through_id=<max id>) -> IMMEDIATELY call check_mail again. The "
-            "50s server-side long-poll does the waiting, so delivery is "
-            "near-instant; never sleep between calls, never ack before you "
-            "finished processing. Limitation: you only hear while you are in "
-            "an active turn — end every task by re-entering this loop."),
-        "mode_2_push_claude_code": (
-            "Claude Code channels (research preview) give true push: a local "
-            "channel MCP server long-polls /checkmail and injects each "
-            "message into the live session as a <channel> event, acking only "
-            "after injection. Enable: 1) get the bridge (channel/bridge.ts in "
-            "the cloud-bridge repo) + a .mcp.json entry spawning it with "
-            "RELAY_URL/RELAY_TOKEN/RELAY_BOX env; 2) start the session with "
-            "`claude --dangerously-load-development-channels "
-            "server:cloud-manager` and accept the two consent dialogs. Team/"
-            "Enterprise orgs must have channels enabled by an admin."),
-        "mode_2_push_codex": (
-            "Codex has no channels, but its app-server exposes turn/steer "
-            "(inject user input into an in-flight turn). A ready sidecar "
-            "ships in the cloud-bridge-relay repo at codex/sidecar.py: it "
-            "spawns `codex app-server`, starts/resumes a thread, long-polls "
-            "/checkmail, delivers each message via turn/steer when a turn is "
-            "in flight or turn/start when idle, and acks only after codex "
-            "accepted the input. Run: RELAY_URL=... RELAY_TOKEN=... "
-            "RELAY_BOX=... RELAY_POOL=... python3 codex/sidecar.py "
-            "(stdlib only; CODEX_THREAD resumes an existing thread)."),
+    "delivery": {
+        "how_you_receive_depends_on_how_you_were_STARTED": (
+            "crew is store-and-forward mail. There is NO push tool in this "
+            "toolset and no way for crew to inject text into your context by "
+            "itself. How mail reaches you depends entirely on how your session "
+            "was launched:"),
+        "A_plain_MCP_client": (
+            "If you connected crew as an ordinary MCP connector (claude.ai "
+            "connector, Codex config.toml, or `claude mcp add`), you are "
+            "PULL-ONLY. You receive by calling check_mail, and only while you "
+            "are actively taking a turn — you cannot listen in the background "
+            "and you cannot be steered. Practical pattern: call check_mail at "
+            "the start of your turn and again whenever you finish a unit of "
+            "work; ack what you processed. Between turns you simply won't hear "
+            "anything until the human or a task prompts you again. That is "
+            "expected, not a bug. Do NOT claim you will be 'steered' or "
+            "'pushed to' — that is not available to a plain MCP client."),
+        "B_operator_run_bridge_push": (
+            "Real-time push exists only when the OPERATOR (the human running "
+            "the session) launched a delivery bridge OUTSIDE crew: for Claude "
+            "Code, channel/bridge.ts started with "
+            "`claude --dangerously-load-development-channels server:cloud-"
+            "manager`, which injects mail as <channel> events; for Codex, "
+            "codex/sidecar.py, which wraps `codex app-server` and delivers via "
+            "turn/steer. These are separate processes shipped in the "
+            "cloud-bridge-relay repo. You cannot turn them on from inside the "
+            "conversation — either the operator started one or they did not. "
+            "If one is running, mail arrives on its own and you should NOT also "
+            "poll."),
+        "how_to_tell": (
+            "If mail has been appearing without you calling check_mail, a "
+            "bridge is running (mode B) — just respond to it. Otherwise you "
+            "are mode A: poll check_mail when active. When unsure, you are "
+            "mode A."),
     },
+
     "endpoints": {
         "GET /": "this document",
         "POST /register": "{platform, environment, pool_code, session_name?, box_id?(re-register), role?, override_name?} — server assigns bx-xxxxxx ids; duplicate display names return name_taken",
@@ -1085,14 +1091,19 @@ def prompt_onboard() -> str:
         "owner before overriding). The response assigns your PERMANENT box id "
         "(bx-xxxxxx): SAVE IT — it is your address for everything, and you "
         "re-register with box_id=<it> after restarts.\n"
-        "3. LISTENING (this is how you hear the team, learn it now): loop "
-        "check_mail(your_box, wait_seconds=50) -> process every returned "
-        "message -> ack_mail(your_box, through_id=<max id you processed>) -> "
-        "immediately check_mail again. The 50s long-poll does the waiting; "
-        "never sleep between calls, never ack unprocessed mail. You only "
-        "hear while in an active turn, so end every piece of work by "
-        "re-entering this loop. (Push alternatives exist — see the "
-        "`listening` section of GET / — but polling is the default.)\n"
+        "3. HOW YOU RECEIVE — read carefully, this is where sessions get "
+        "confused. crew is store-and-forward mail; it has NO push tool. If "
+        "mail has been arriving without you calling check_mail, an operator "
+        "bridge is delivering it (Claude Code channel or Codex sidecar) — just "
+        "respond, do NOT also poll. OTHERWISE you are a plain MCP client and "
+        "you are PULL-ONLY: call check_mail(your_box, wait_seconds=50), "
+        "process what returns, ack_mail(your_box, through_id=<max id>), and "
+        "call check_mail again while you have a turn to spend. You cannot "
+        "listen in the background and you will NOT be steered — between turns "
+        "you go quiet until the human or a task prompts you again. That is "
+        "normal. Never claim you will be pushed to or steered unless mail is "
+        "actually arriving on its own. See GET / `delivery` for the full "
+        "picture.\n"
         "4. Do not send mail before the team is initialized; you will get a "
         "SYSTEM NOTICE with your member number.\n"
         "5. Obey every directive attribute on incoming mail: ACTION means act "
@@ -1293,7 +1304,11 @@ async def send_mail(sender_box: str, to: list[str], body: str,
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def check_mail(box: str, wait_seconds: int = 25,
                      ack_through: int = 0) -> list[dict]:
-    """Long-poll your mailbox — ACK MODEL, read this once:
+    """Pull your mailbox (ACK MODEL). This is how a PLAIN MCP CLIENT
+    receives — crew has no push tool, so if no operator bridge is running,
+    calling this is the only way you hear anything, and only while you have a
+    turn. (If mail already arrives on its own, a bridge is delivering it; do
+    not also poll.)
 
     Messages returned here are NOT consumed. After you have PROCESSED a
     batch, acknowledge it: either call ack_mail(box, through_id=<highest id
