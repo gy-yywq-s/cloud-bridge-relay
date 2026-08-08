@@ -7,6 +7,17 @@ human owner reachable by real email.
 Everything is server-side, so a team survives sessions crashing, restarting,
 or moving between machines.
 
+> **Two implementations.** The original relay is `relay.py` (Python, single
+> server behind a gateway). [`crew-ts/`](crew-ts/) is the **self-hostable
+> TypeScript rewrite** for release: a built-in OAuth 2.1 server, a web dashboard,
+> and three deployment modes —
+> **local** (loopback, no auth), **private** (your devices, one shared trust
+> domain), and **cloud** (public, invite-gated registration with a **separate
+> database per account**). The bundled plugins below connect to the maintainer's
+> TS cloud instance at `crew.gaelisus.com`. To run your own, see
+> [`crew-ts/README.md`](crew-ts/README.md) and the connector examples in
+> [`crew-ts/connectors/`](crew-ts/connectors/).
+
 ```
 sessions ──MCP──▶  crew relay  ──email──▶  owner
    │                (SQLite)                 │
@@ -50,6 +61,8 @@ sessions ──MCP──▶  crew relay  ──email──▶  owner
 | `plugin/` | Claude Code plugin: slash commands, Stop-hook delivery watcher, bundled MCP config |
 | `plugins/codex/crew/` | Codex plugin: skills mirroring the same workflows |
 | `.claude-plugin/`, `.agents/plugins/` | marketplace manifests for each host |
+| `crew-ts/` | **TypeScript rewrite** — self-hostable, OAuth 2.1, web dashboard, local/private/cloud modes, per-account isolation. See its own README. |
+| `crew-ts/connectors/` | ready-to-copy connector configs per client (Claude Code / Codex / claude.ai) × mode |
 
 ## Install the plugins
 
@@ -63,9 +76,12 @@ sessions ──MCP──▶  crew relay  ──email──▶  owner
 **Codex** — ChatGPT desktop → Plugins → Add plugin marketplace →
 `gy-yywq-s/cloud-bridge-relay`, ref `main`, then install **crew**.
 
-Both plugins point at the maintainer's instance (`crew.gaelis.cc`), which
-requires a credential you will not have. To use crew, run your own relay and
-change the URL in `plugin/.mcp.json` / `plugins/codex/crew/.mcp.json`.
+Both plugins point at the maintainer's TS cloud instance
+(`crew.gaelisus.com`). Connecting runs the OAuth browser flow; registering a new
+account there needs an **invite code**. To run your own instead, see
+[`crew-ts/`](crew-ts/) and change the URL in `plugin/.mcp.json` /
+`plugins/codex/crew/.mcp.json` (examples in
+[`crew-ts/connectors/`](crew-ts/connectors/)).
 
 ## Run your own relay
 

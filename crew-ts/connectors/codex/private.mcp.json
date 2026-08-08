@@ -1,7 +1,7 @@
 {
   "mcp_servers": {
     "crew": {
-      "url": "https://crew.gaelisus.com/mcp"
+      "url": "https://<your-host>/mcp"
     }
   }
 }

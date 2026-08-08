@@ -52,6 +52,9 @@ const app = new Hono<{ Variables: { accountId: number | null } }>();
 // Cap request bodies before they are buffered/parsed into memory.
 app.use("*", bodyLimit({ maxSize: cfg.limits.max_body * 2, onError: (c) => c.json({ error: "body_too_large" }, 413) }));
 app.get("/health", (c) => c.json({ ok: true, mode: cfg.mode, brand: cfg.brand.name }));
+// Root: send humans to the dashboard (which bounces to /login when needed).
+// Local mode has no auth, so the dashboard is the landing page directly.
+app.get("/", (c) => c.redirect("/app"));
 
 // ── auth (private/cloud) ───────────────────────────────────────────────────
 const oauth = makeProvider(ctrl);

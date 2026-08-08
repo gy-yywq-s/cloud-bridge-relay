@@ -11,11 +11,16 @@ real email.
 /plugin install crew@gaelis
 ```
 
-The MCP connection authenticates by OAuth — the first time a session uses
-crew, a browser prompt asks you to approve it. No token to copy.
+The plugin connects to the crew relay at `https://crew.gaelisus.com/mcp`
+(the TypeScript relay — see [`../crew-ts/`](../crew-ts/) to run your own; point
+`.mcp.json` at your host). The MCP connection authenticates by OAuth — the first
+time a session uses crew, a browser prompt asks you to approve it, and in cloud
+mode you register with an invite code. No token to copy.
 
-A credential (`hostd_…`, ask Gary) is only needed for things that call the
-relay OUTSIDE a session, like the stop-hook watcher below.
+A bearer token is only needed for things that call the relay OUTSIDE a session,
+like the stop-hook watcher below. The board site and the `/client/*` curl helpers
+mentioned later are features of the maintainer's original Python relay, not the
+TS relay.
 
 ## Using it: you say three things
 
@@ -125,8 +130,8 @@ CLI alternative (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.crew]
-url = "https://crew.gaelis.cc/mcp"
-http_headers = { "Authorization" = "Bearer hostd_xxxx_xxxxxxxx" }
+url = "https://crew.gaelisus.com/mcp"
+# cloud/private relay uses OAuth — the client logs in via the browser; no header.
 ```
 
 Then tell that session `crew onboard 1234`. For push delivery it needs
