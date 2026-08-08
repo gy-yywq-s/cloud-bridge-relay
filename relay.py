@@ -2004,6 +2004,8 @@ def wiz_apply(code, step_id, answer):
             do_attach_owner(code)
     elif step_id == "owner_mode":
         mode = low.split()[0] if low else "a"
+        if mode in ("default", ""):
+            mode = step["default"]  # 'default' is valid EVERYWHERE, this step included
         if mode not in OWNER_MODES:
             return False, {"error": "bad_answer", "detail": step["answer_format"]}
         if mode == "d":
