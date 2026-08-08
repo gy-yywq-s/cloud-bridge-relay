@@ -679,9 +679,29 @@ def do_ack(box, through_id):
 
 # ---------------- registration / pools / teams ----------------
 
-def do_register(box, session_name, platform, environment, pool_code, role=""):
-    if not BOX_RE.match(box or "") or box == OWNER_BOX:
-        return {"error": "bad_box", "detail": BOX_RE.pattern + " ('owner' reserved)"}
+def name_conflict(name, own_box):
+    """Another box whose display name matches `name` (case-insensitive)."""
+    if not name:
+        return None
+    low = name.strip().lower()
+    for r in db().execute("SELECT * FROM boxes"):
+        if r["box"] == own_box:
+            continue
+        if display_name(r).strip().lower() == low:
+            return r["box"]
+    return None
+
+
+def do_register(box, session_name, platform, environment, pool_code, role="",
+                override_name=False):
+    if box:
+        if box == OWNER_BOX or not BOX_RE.match(box):
+            return {"error": "bad_box", "detail": "'owner' reserved; " + BOX_RE.pattern}
+        if box_row(box) is None:
+            return {"error": "unknown_box",
+                    "detail": ("box ids are assigned by the server. Omit "
+                               "box_id on first registration and SAVE the id "
+                               "you get back; pass it only to re-register.")}
     if platform not in PLATFORMS:
         return {"error": "bad_platform",
                 "detail": f"declare your platform: one of {PLATFORMS}. This is "
@@ -692,6 +712,23 @@ def do_register(box, session_name, platform, environment, pool_code, role=""):
         return {"error": "bad_pool_code",
                 "detail": "pool_code is the 4-digit code the owner gave you; "
                           "you cannot enter the waiting pool without it"}
+    prev_b = box_row(box) if box else None
+    same_name = (prev_b is not None and str(session_name or "").strip().lower()
+                 == (prev_b["session_name"] or "").strip().lower())
+    clash = None if same_name else name_conflict(str(session_name or ""), box)
+    if clash and not override_name:
+        return {"error": "name_taken", "conflict_with": clash,
+                "directive": ("NAME COLLISION: another member already displays "
+                              "as this name (box " + clash + "). TELL THE OWNER "
+                              "and ask how to proceed. If the owner explicitly "
+                              "approves the duplicate, call register_box again "
+                              "with override_name=true; otherwise pick a "
+                              "different session_name.")}
+    if not box:
+        while True:
+            box = "bx-" + secrets.token_hex(3)
+            if box_row(box) is None:
+                break
     b = box_row(box)
     status = "waiting" if not (b and b["team_code"]) else b["status"]
     touch_box(box, session_name=str(session_name or "")[:200], platform=platform,
@@ -700,7 +737,10 @@ def do_register(box, session_name, platform, environment, pool_code, role=""):
     db().commit()
     return {"ok": True, "box": box, "status": status, "pool_code": str(pool_code),
             "role": role or "(none)",
-            "directive": ("REGISTERED INTO WAITING POOL " + str(pool_code) +
+            "directive": ("YOUR BOX ID IS " + box + " — SAVE IT, it is your "
+                          "permanent address (re-register with box_id=" + box +
+                          " after restarts). REGISTERED INTO WAITING POOL " +
+                          str(pool_code) +
                           ". Now poll your box (check_mail) and WAIT. Do not "
                           "send mail yet. When the owner initializes the team "
                           "you will receive a SYSTEM NOTICE with your member "
@@ -841,12 +881,20 @@ def do_set_team_name(code, name):
     return {"ok": True, **team_roster(code)}
 
 
-def do_set_member_alias(code, member_no, alias):
+def do_set_member_alias(code, member_no, alias, override_name=False):
     code = str(code)
     r = db().execute("SELECT * FROM boxes WHERE team_code=? AND member_no=?",
                      (code, int(member_no))).fetchone()
     if not r:
         return {"error": "no_such_member"}
+    clash = name_conflict(str(alias or ""), r["box"])
+    if clash and not override_name:
+        return {"error": "name_taken", "conflict_with": clash,
+                "directive": ("NAME COLLISION: another member already displays "
+                              "as this name (box " + clash + "). READ THIS TO "
+                              "THE OWNER; only if the owner explicitly approves "
+                              "the duplicate, call again with "
+                              "override_name=true.")}
     db().execute("UPDATE boxes SET alias=? WHERE box=?", (str(alias)[:200], r["box"]))
     db().commit()
     bump_rv(code)
@@ -984,7 +1032,7 @@ USAGE = {
     },
     "endpoints": {
         "GET /": "this document",
-        "POST /register": "{box, platform, environment, pool_code, session_name?, role?}",
+        "POST /register": "{platform, environment, pool_code, session_name?, box_id?(re-register), role?, override_name?} — server assigns bx-xxxxxx ids; duplicate display names return name_taken",
         "GET /pool?code=X": "who waits in pool X",
         "POST /team/create": "{pool_code, coordinator_box}",
         "POST /team/join": "{code, box}",
@@ -1029,11 +1077,13 @@ def prompt_onboard() -> str:
         "You are joining a multi-session team relay. Follow EXACTLY:\n"
         "1. The owner's message contains a 4-digit pool code. If you do not "
         "have one, STOP and ask the owner for it.\n"
-        "2. Pick a short stable box name for yourself (lowercase). Call "
-        "register_box(box, platform, environment, pool_code, session_name?) — "
-        "platform is 'claude-code' or 'codex', whichever you actually are; "
-        "environment is one line like 'cloud VM / ubuntu' or 'MacBook / macOS "
-        "/ local'.\n"
+        "2. Call register_box(platform, environment, pool_code, "
+        "session_name) — platform is 'claude-code' or 'codex', whichever you "
+        "actually are; environment is one line like 'cloud VM / ubuntu'; "
+        "session_name is your human-readable name (on name_taken, ask the "
+        "owner before overriding). The response assigns your PERMANENT box id "
+        "(bx-xxxxxx): SAVE IT — it is your address for everything, and you "
+        "re-register with box_id=<it> after restarts.\n"
         "3. LISTENING (this is how you hear the team, learn it now): loop "
         "check_mail(your_box, wait_seconds=50) -> process every returned "
         "message -> ack_mail(your_box, through_id=<max id you processed>) -> "
@@ -1110,19 +1160,24 @@ def prompt_status() -> str:
 # ---------------- MCP tools ----------------
 
 @mcp.tool()
-async def register_box(box: str, platform: str, environment: str,
-                       pool_code: str, session_name: str = "",
-                       role: str = "") -> dict:
-    """Register your mailbox into a waiting pool.
+async def register_box(platform: str, environment: str, pool_code: str,
+                       session_name: str = "", box_id: str = "",
+                       role: str = "", override_name: bool = False) -> dict:
+    """Register into a waiting pool. The server assigns your box id.
 
-    box: stable lowercase name (yours forever; 'owner' is reserved).
     platform: MANDATORY 'claude-code' or 'codex' — stamped on every message.
     environment: one line, e.g. 'cloud session / ubuntu' or 'MacBook / macOS'.
     pool_code: the 4-digit code the owner gave you. No code, no pool.
+    session_name: your human-readable name. If it collides with an existing
+    member you get name_taken — ask the owner; only on the owner's explicit
+    approval retry with override_name=true.
+    box_id: OMIT on first registration — the response assigns you a permanent
+    id (bx-xxxxxx); SAVE IT and pass it here to re-register after a restart.
     role: optional 'manager' or 'worker' (can also be set later in setup).
     Then poll check_mail and WAIT for the initialization notice.
     """
-    return do_register(box, session_name, platform, environment, pool_code, role)
+    return do_register(box_id, session_name, platform, environment, pool_code,
+                       role, override_name)
 
 
 @mcp.tool()
@@ -1153,9 +1208,12 @@ async def set_team_name(code: str, name: str) -> dict:
 
 
 @mcp.tool()
-async def set_member_alias(code: str, member_no: int, alias: str) -> dict:
-    """Setup center: set the alias the owner chose for one member. Broadcasts."""
-    return do_set_member_alias(code, member_no, alias)
+async def set_member_alias(code: str, member_no: int, alias: str,
+                           override_name: bool = False) -> dict:
+    """Setup center: set the alias the owner chose for one member. Duplicate
+    display names return name_taken — read it to the owner and retry with
+    override_name=true only on the owner's explicit approval. Broadcasts."""
+    return do_set_member_alias(code, member_no, alias, override_name)
 
 
 @mcp.tool()
@@ -1310,9 +1368,11 @@ async def _r_health(_req, _p):
 
 
 async def _r_register(_req, p):
-    return do_register(p.get("box", ""), p.get("session_name", ""),
+    return do_register(p.get("box_id", p.get("box", "")),
+                       p.get("session_name", ""),
                        p.get("platform", ""), p.get("environment", ""),
-                       p.get("pool_code", ""), p.get("role", ""))
+                       p.get("pool_code", ""), p.get("role", ""),
+                       bool(p.get("override_name")))
 
 
 async def _r_team_create(_req, p):
@@ -1331,7 +1391,8 @@ async def _r_team_name(_req, p):
 async def _r_team_alias(_req, p):
     try:
         return do_set_member_alias(p.get("code", ""), int(p.get("member_no", 0)),
-                                   p.get("alias", ""))
+                                   p.get("alias", ""),
+                                   bool(p.get("override_name")))
     except (TypeError, ValueError):
         return {"error": "bad_member_no"}
 

@@ -30,7 +30,11 @@ import urllib.request
 
 RELAY_URL = os.environ["RELAY_URL"].rstrip("/")
 TOKEN = os.environ["RELAY_TOKEN"]
-BOX = os.environ["RELAY_BOX"]
+# Box ids are server-assigned; persist ours so restarts keep the same address.
+ID_FILE = os.path.expanduser("~/.crew_box_id_codex")
+BOX = os.environ.get("RELAY_BOX", "")
+if not BOX and os.path.exists(ID_FILE):
+    BOX = open(ID_FILE).read().strip()
 POOL = os.environ.get("RELAY_POOL", "")
 RENV = os.environ.get("RELAY_ENV", "codex / local")
 UA = "crew-codex-sidecar/1"
@@ -143,13 +147,24 @@ def render(m):
 def main():
     cx = Codex()
     cx.start()
+    global BOX
     if POOL:
         try:
-            print("[sidecar] register:", relay("/register", {
-                "box": BOX, "platform": "codex", "environment": RENV,
-                "pool_code": POOL}), flush=True)
+            payload = {"platform": "codex", "environment": RENV,
+                       "pool_code": POOL,
+                       "session_name": os.environ.get("RELAY_NAME", "")}
+            if BOX:
+                payload["box_id"] = BOX
+            r = relay("/register", payload)
+            print("[sidecar] register:", r, flush=True)
+            if r.get("ok") and r.get("box") and r["box"] != BOX:
+                BOX = r["box"]
+                open(ID_FILE, "w").write(BOX)
+                print(f"[sidecar] assigned box id {BOX} (saved)", flush=True)
         except Exception as e:
             print(f"[sidecar] register failed: {e}", flush=True)
+    if not BOX:
+        sys.exit("no box id: set RELAY_POOL to register or RELAY_BOX to reuse one")
     while True:
         try:
             out = relay(f"/checkmail?box={BOX}&wait=50")
