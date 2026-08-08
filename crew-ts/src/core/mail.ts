@@ -54,7 +54,16 @@ export function doSend(
     return [null, { error: "bad_recipients", detail: "`to` required; `to`/`cc` are a box name or list" }];
   if (typeof body !== "string" || !body.trim()) return [null, { error: "empty_body" }];
   if (body.length > c.cfg.limits.max_body) return [null, { error: "body_too_large" }];
+  // The sender must be a registered box — no auto-vivification of a fresh (or
+  // reserved 'owner') box on the send path, which would be an impersonation hole.
+  if (!boxRow(c, sender)) return [null, { error: "unknown_box", detail: "register_box first; senders cannot be conjured on send" }];
   const cc2 = ccRaw.filter((x) => !toL.includes(x));
+  // dedup BEFORE rate limit: an idempotent retry must resolve to the original
+  // id, never be masked by a false rate_limited.
+  if (opts.dedupKey) {
+    const dup = c.db.prepare("SELECT id FROM messages WHERE sender=? AND client_key=?").get(sender, String(opts.dedupKey).slice(0, 100)) as { id: number } | undefined;
+    if (dup) return [{ ok: true, id: dup.id, delivered_to: toL.concat(cc2), from: senderStamp(c, sender), duplicate: true }, null];
+  }
   const gate = ownerGate(c, sender, toL, cc2, opts.ownerJustification || "");
   if (gate) return [null, gate];
   const limited = rateCheck(c, sender);
@@ -65,9 +74,11 @@ export function doSend(
     if (!Number.isInteger(replyTo) || !c.db.prepare("SELECT 1 FROM messages WHERE id=?").get(replyTo))
       return [null, { error: "bad_reply_to", detail: `no message #${replyTo} (pruned or never existed)` }];
   }
-  if (opts.dedupKey) {
-    const dup = c.db.prepare("SELECT id FROM messages WHERE sender=? AND client_key=?").get(sender, String(opts.dedupKey).slice(0, 100)) as { id: number } | undefined;
-    if (dup) return [{ ok: true, id: dup.id, delivered_to: toL.concat(cc2), from: senderStamp(c, sender), duplicate: true }, null];
+  // per-recipient queue cap: refuse rather than let a never-polled box grow without bound.
+  for (const r of toL.concat(cc2)) {
+    const q = (c.db.prepare("SELECT count(*) n FROM deliveries WHERE recipient=? AND taken_ts IS NULL").get(r) as { n: number }).n;
+    if (q >= c.cfg.limits.max_queue)
+      return [null, { error: "recipient_queue_full", recipient: r, detail: `${r} has ${q} unread messages (cap ${c.cfg.limits.max_queue}); it is likely not polling. Not sent.` }];
   }
   let finalBody = body;
   if (opts.ownerJustification && toL.includes(OWNER_BOX)) finalBody = `[owner-direct justification: ${opts.ownerJustification}]\n\n${body}`;
@@ -75,9 +86,12 @@ export function doSend(
   const mid = insertMessage(c, sender, stamp.display_name, "mail", toL, cc2, finalBody);
   if (replyTo != null) c.db.prepare("UPDATE messages SET reply_to=? WHERE id=?").run(replyTo, mid);
   if (opts.dedupKey) c.db.prepare("UPDATE messages SET client_key=? WHERE id=?").run(String(opts.dedupKey).slice(0, 100), mid);
-  if (toL.includes(OWNER_BOX) || cc2.includes(OWNER_BOX)) void emailOwnerDelivery(c, mid);
+  // Fire-and-forget email is best-effort; a rejection must never crash the process.
+  if (toL.includes(OWNER_BOX) || cc2.includes(OWNER_BOX))
+    emailOwnerDelivery(c, mid).catch((err) => console.error("owner email delivery failed:", err));
   c.db.prepare("DELETE FROM messages WHERE ts < datetime('now', ?) AND id IN (SELECT msg_id FROM deliveries GROUP BY msg_id HAVING count(*) = count(taken_ts))")
     .run(`-${c.cfg.limits.prune_days} days`);
+  c.db.prepare("DELETE FROM deliveries WHERE msg_id NOT IN (SELECT id FROM messages)").run();
   touchBox(c, sender);
   return [{ ok: true, id: mid, delivered_to: toL.concat(cc2), from: stamp }, null];
 }
@@ -128,19 +142,22 @@ export function envelope(c: Ctx, row: MsgRow): Record<string, unknown> {
   return e;
 }
 
-function attachTeamInfo(c: Ctx, e: Record<string, unknown>, recipient: string): void {
+function attachTeamInfo(c: Ctx, e: Record<string, unknown>, recipient: string, persist: boolean): void {
   const stamp = e.from as Stamp;
   if (!stamp.team) return;
   const t = c.db.prepare("SELECT name, rv FROM teams WHERE code=?").get(stamp.team) as { name: string; rv: number } | undefined;
   const rv = t?.rv ?? 1;
   const tname = t?.name || stamp.team;
   const n = (c.db.prepare("SELECT count(*) c FROM boxes WHERE team_code=?").get(stamp.team) as { c: number }).c;
-  // change-aware footer: full card once per roster version per recipient
+  // change-aware footer: full card once per roster version per recipient.
+  // Only a real (take=true) read advances the seen marker — peek must not
+  // consume a recipient's one-shot full card.
   const seen = c.db.prepare("SELECT rv FROM roster_seen WHERE box=? AND team=?").get(recipient, stamp.team) as { rv: number } | undefined;
   if ((seen?.rv ?? 0) < rv) {
     e.team_info = teamCard(c, stamp.team);
-    c.db.prepare("INSERT INTO roster_seen(box,team,rv) VALUES(?,?,?) ON CONFLICT(box,team) DO UPDATE SET rv=excluded.rv")
-      .run(recipient, stamp.team, rv);
+    if (persist)
+      c.db.prepare("INSERT INTO roster_seen(box,team,rv) VALUES(?,?,?) ON CONFLICT(box,team) DO UPDATE SET rv=excluded.rv")
+        .run(recipient, stamp.team, rv);
   } else {
     e.team_info = `team ${tname} · ${stamp.team} · ${n} members · roster v${rv} · list_team('${stamp.team}') for detail`;
   }
@@ -148,9 +165,9 @@ function attachTeamInfo(c: Ctx, e: Record<string, unknown>, recipient: string): 
 
 export function fetchBox(c: Ctx, box: string, take: boolean): Record<string, unknown>[] {
   const rows = c.db.prepare(
-    "SELECT m.*, d.delivered_as FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.recipient=? AND d.taken_ts IS NULL ORDER BY m.id",
-  ).all(box) as MsgRow[];
-  const out = rows.map((r) => { const e = envelope(c, r); attachTeamInfo(c, e, box); return e; });
+    "SELECT m.*, d.delivered_as FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE d.recipient=? AND d.taken_ts IS NULL ORDER BY m.id LIMIT ?",
+  ).all(box, c.cfg.limits.max_queue) as MsgRow[];
+  const out = rows.map((r) => { const e = envelope(c, r); attachTeamInfo(c, e, box, take); return e; });
   if (take && rows.length) {
     const upd = c.db.prepare("UPDATE deliveries SET taken_ts=? WHERE msg_id=? AND recipient=?");
     for (const r of rows) upd.run(now(), r.id, box);

@@ -25,6 +25,7 @@ export function doTaskAdd(c: Ctx, team: string, title: string, detail: string, c
   if (!String(title).trim()) return { error: "empty_title" };
   let d = deps || [];
   if (!Array.isArray(d)) return { error: "bad_deps", detail: "deps is a list of task ids" };
+  if (d.length > 64) return { error: "bad_deps", detail: "at most 64 dependencies per task" };
   d = d.map(Number);
   if (d.some((x) => !Number.isInteger(x))) return { error: "bad_deps" };
   for (const dep of d) { const r = taskRow(c, dep); if (!r || r.team !== team) return { error: "bad_deps", detail: `no task #${dep} in this team` }; }

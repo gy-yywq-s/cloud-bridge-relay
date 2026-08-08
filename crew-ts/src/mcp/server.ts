@@ -51,11 +51,11 @@ export function buildMcpServer(c: Ctx): McpServer {
     });
 
   // ── setup ─────────────────────────────────────────────────────────────
-  s.registerTool("setup_questions", { description: "The remaining team-setup interview as ONE batch. Ask the human all of it in a single message (Claude Code: AskUserQuestion; else one numbered message), then submit setup_answers.", inputSchema: { code: z.string(), restart: z.boolean().default(false) }, annotations: RO },
+  s.registerTool("setup_questions", { description: "The remaining team-setup interview as ONE batch. Ask the human all of it in a single message (Claude Code: AskUserQuestion; else one numbered message), then submit setup_answers.", inputSchema: { code: z.string(), restart: z.boolean().default(false) }, annotations: WRi },
     async ({ code, restart }) => J(wizQuestions(c, code, restart)));
   s.registerTool("setup_answers", { description: "Submit the human's answers for several interview steps at once: answers={step_id: answer}. Per-item problems come back under `errors`; `next` holds what remains or the completion payload.", inputSchema: { code: z.string(), answers: z.record(z.string(), z.string()) }, annotations: WR },
     async ({ code, answers }) => J(wizAnswersBatch(c, code, answers)));
-  s.registerTool("setup_next", { description: "Legacy one-question-at-a-time interview. Prefer setup_questions.", inputSchema: { code: z.string(), restart: z.boolean().default(false) }, annotations: RO },
+  s.registerTool("setup_next", { description: "Legacy one-question-at-a-time interview. Prefer setup_questions.", inputSchema: { code: z.string(), restart: z.boolean().default(false) }, annotations: WRi },
     async ({ code, restart }) => J(wizNext(c, code, restart)));
 
   // ── team management ───────────────────────────────────────────────────

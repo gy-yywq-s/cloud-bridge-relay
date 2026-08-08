@@ -1,6 +1,7 @@
 // Entry point: load config, open db, build the MCP server + Hono app
 // (MCP transport + REST mirror + health), start the sweeps, listen.
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { serve } from "@hono/node-server";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { loadConfig } from "./config.js";
@@ -24,7 +25,17 @@ const db = openDb(cfg);
 const ctx: Ctx = { db, cfg, email: makeEmail(cfg) };
 startSweeps(ctx);
 
+// A rejected promise or thrown timer must never take the relay down.
+process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+
+// Auth is not wired yet; refuse to masquerade as gated when it is not.
+if (cfg.mode !== "local")
+  console.warn(`[crew] WARNING: mode='${cfg.mode}' but OAuth/auth is not yet implemented — every endpoint is currently OPEN. Do not expose this to an untrusted network until auth lands.`);
+
 const app = new Hono();
+// Cap request bodies before they are buffered/parsed into memory.
+app.use("*", bodyLimit({ maxSize: cfg.limits.max_body * 2, onError: (c) => c.json({ error: "body_too_large" }, 413) }));
 app.get("/health", (c) => c.json({ ok: true, mode: cfg.mode, brand: cfg.brand.name }));
 
 // ── MCP endpoint (stateless per request) ──────────────────────────────────

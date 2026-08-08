@@ -81,6 +81,9 @@ export function asBoxList(v: unknown): string[] | null {
 export function touchBox(c: Ctx, box: string, fields: Partial<BoxRow> = {}): void {
   const b = boxRow(c, box);
   if (!b) {
+    const count = (c.db.prepare("SELECT count(*) n FROM boxes").get() as { n: number }).n;
+    if (count >= c.cfg.limits.max_boxes)
+      throw new Error(`box limit reached (${c.cfg.limits.max_boxes}); refusing to create ${box}`);
     c.db.prepare(
       "INSERT INTO boxes(box,alias,session_name,created_ts,last_seen,platform,env,status) VALUES(?,?,?,?,?,?,?,?)",
     ).run(box, fields.alias ?? "", fields.session_name ?? "", now(), now(),

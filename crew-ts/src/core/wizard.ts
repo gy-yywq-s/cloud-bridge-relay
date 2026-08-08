@@ -61,8 +61,10 @@ function wizApply(c: Ctx, code: string, stepId: string, answer: string): [boolea
   } else if (stepId === "manager") {
     if (!["none", ""].includes(low)) {
       const mgr = Number(low);
-      if (!Number.isInteger(mgr)) return [false, { error: "bad_answer", detail: step.answer_format }];
-      for (const m of fullMembers(c, code)) { if (m.box === OWNER_BOX) continue; doSetBoxRole(c, code, m.member_no, m.member_no === mgr ? "manager" : "worker"); }
+      const members = fullMembers(c, code).filter((m) => m.box !== OWNER_BOX);
+      if (!Number.isInteger(mgr) || !members.some((m) => m.member_no === mgr))
+        return [false, { error: "bad_answer", detail: `${step.answer_format}; valid member numbers: ${members.map((m) => m.member_no).join(", ")}` }];
+      for (const m of members) doSetBoxRole(c, code, m.member_no, m.member_no === mgr ? "manager" : "worker");
     }
   } else if (stepId === "owner_setup") {
     if (low === "yes") return [true, { handoff: "owner_mailbox", directive: "The owner wants a mailbox. RUN THE add-owner-mailbox FLOW NOW (setup_owner_mailbox -> owner confirms receipt -> confirm_owner_mailbox), then call setup_next/setup_questions again — the wizard will pick up with attaching it." }];
@@ -86,14 +88,17 @@ export function wizNext(c: Ctx, code: string, restart = false): Record<string, u
     if (step.id in answers) continue;
     wizSave(c, code, step.id, answers, 0);
     const total = wizSteps(c, code).length;
-    return { step_id: step.id, progress: `${Object.keys(answers).length + 1}/${total}`, say_to_owner: `[setup ${Object.keys(answers).length + 1}/${total}] ${step.ask}\n(${step.options.join(" / ")} — "default" = ${step.default || "<team-name>-<number>"})`, relay_rule: RELAY_RULE, ask_owner_verbatim: step.ask, options: step.options, default_if_owner_says_default: step.default || "<team-name>-<number>", answer_format: step.answer_format, directive: "ASK THE OWNER THIS QUESTION, VERBATIM, AND NOTHING ELSE. When the owner answers, call setup_answer(code, step_id, answer). 'default' is a valid answer. Configuration setters stay REFUSED until this wizard is done." };
+    return { step_id: step.id, progress: `${Object.keys(answers).length + 1}/${total}`, say_to_owner: `[setup ${Object.keys(answers).length + 1}/${total}] ${step.ask}\n(${step.options.join(" / ")} — "default" = ${step.default || "<team-name>-<number>"})`, relay_rule: RELAY_RULE, ask_owner_verbatim: step.ask, options: step.options, default_if_owner_says_default: step.default || "<team-name>-<number>", answer_format: step.answer_format, directive: "ASK THE OWNER THIS QUESTION, VERBATIM, AND NOTHING ELSE. When the owner answers, call setup_answers(code, { \"" + step.id + "\": \"<their answer>\" }). 'default' is a valid answer. Prefer setup_questions to ask the whole batch at once. Configuration setters stay REFUSED until this wizard is done." };
   }
   return wizDone(c, code, answers);
 }
 
 function wizDone(c: Ctx, code: string, answers: Record<string, string>): Record<string, unknown> {
+  const already = wizRow(c, code)?.done;
   wizSave(c, code, "", answers, 1);
-  broadcastTeam(c, code, "SETUP COMPLETE for this team.\n\n" + rosterText(c, code));
+  // Idempotent: only broadcast SETUP COMPLETE on the transition, never on
+  // repeat calls (re-running the entry point would otherwise spam the team).
+  if (!already) broadcastTeam(c, code, "SETUP COMPLETE for this team.\n\n" + rosterText(c, code));
   return { done: true, summary: rosterText(c, code), answers,
     say_to_owner: `Setup complete. Here is your crew:\n\n${rosterText(c, code)}\n\nLive board: ${c.cfg.brand.board_url || "(configure public_url)"} — view key: ${teamViewKey(c, code)} (read-only, keep it semi-private). To change anything later — a name, a role, the whole setup — just say so in plain words; no ids to remember, your sessions know the team.`,
     relay_rule: RELAY_RULE,
