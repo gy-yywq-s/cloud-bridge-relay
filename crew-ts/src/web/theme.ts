@@ -40,6 +40,16 @@ body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans)
 a{color:var(--accent-ink);text-decoration:none} a:hover{text-decoration:underline}
 .wrap{max-width:960px;margin:0 auto;padding:28px 20px 80px}
 .brandbar{display:flex;align-items:center;gap:10px;padding:14px 0 22px;border-bottom:1px solid var(--rule);margin-bottom:26px}
+/* centered single-column shell for auth screens (login / signup / consent) */
+.authwrap{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:32px 20px}
+.authbrand{display:inline-flex;align-items:center;gap:10px;text-decoration:none}
+.authbrand:hover{text-decoration:none}
+.authwrap .card{width:100%;max-width:400px;margin:0}
+.authwrap .btn{width:100%;justify-content:center}
+.authwrap h1{font-size:22px;margin:0 0 6px}
+.altlink{font-size:13px;color:var(--ink-2);margin:16px 0 0;text-align:center}
+.mark{width:26px;height:26px;display:inline-flex;flex:0 0 auto}
+.mark svg{width:100%;height:100%;display:block;border-radius:7px}
 .logo{font:700 20px/1 var(--mono);letter-spacing:-.02em}
 .logo::after{content:"_";color:var(--accent)}
 .muted{color:var(--ink-3)} .small{font-size:13px}
@@ -81,16 +91,51 @@ pre{font:12.5px/1.55 var(--mono);background:var(--paper-2);border:1px solid var(
 
 const esc = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
+// The crew mark: a terminal prompt chevron + stacked message lines + cursor
+// underscore. Built from the configured accent so it recolors with the theme
+// (see assets/icon.svg for the master used by the GitHub app / app icon).
+export function markSvg(accent: string, tile = true): string {
+  const t = tile ? `<rect width="32" height="32" rx="7" fill="${accent}"/>` : "";
+  const fg = tile ? "#fff" : accent;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">${t}` +
+    `<path fill="${fg}" d="m6.5 8.5 7.5 7.5-7.5 7.5L4 21l5-5-5-5z"/>` +
+    `<rect x="15" y="10" width="12" height="3.5" rx="1.75" fill="${fg}"/>` +
+    `<rect x="15" y="15" width="8.5" height="3.5" rx="1.75" fill="${fg}"/>` +
+    `<rect x="21" y="21" width="6" height="3" rx="1.5" fill="${fg}"/></svg>`;
+}
+
+function faviconLink(cfg: Config): string {
+  const uri = "data:image/svg+xml," + encodeURIComponent(markSvg(cfg.brand.accent || "#1c4f8f"));
+  return `<link rel="icon" type="image/svg+xml" href="${uri}"><link rel="apple-touch-icon" href="${uri}">`;
+}
+
 export function page(cfg: Config, title: string, bodyHtml: string, opts: { toast?: string } = {}): string {
   const toast = opts.toast ? `<div class="toast">${esc(opts.toast)}</div>` : "";
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${esc(title)} · ${esc(cfg.brand.name)}</title>
+${faviconLink(cfg)}
 <style>${themeCss(cfg)}</style></head>
 <body><div class="wrap">
-<div class="brandbar"><span class="logo">${esc(cfg.brand.name)}</span><span class="muted small">${esc(title)}</span></div>
+<div class="brandbar"><span class="mark" aria-hidden="true">${markSvg(cfg.brand.accent || "#1c4f8f")}</span><span class="logo">${esc(cfg.brand.name)}</span><span class="muted small">${esc(title)}</span></div>
 ${bodyHtml}
+</div>${toast}</body></html>`;
+}
+
+// Centered single-card shell for the auth screens (login / signup / consent /
+// auth errors). Brand mark sits above the card; nothing is left-aligned.
+export function authPage(cfg: Config, title: string, cardHtml: string, opts: { toast?: string } = {}): string {
+  const toast = opts.toast ? `<div class="toast">${esc(opts.toast)}</div>` : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>${esc(title)} · ${esc(cfg.brand.name)}</title>
+${faviconLink(cfg)}
+<style>${themeCss(cfg)}</style></head>
+<body><div class="authwrap">
+<a class="authbrand" href="/"><span class="mark" aria-hidden="true">${markSvg(cfg.brand.accent || "#1c4f8f")}</span><span class="logo">${esc(cfg.brand.name)}</span></a>
+${cardHtml}
 </div>${toast}</body></html>`;
 }
 

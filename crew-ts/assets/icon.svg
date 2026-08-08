@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">crew app icon</title>
+  <rect width="512" height="512" rx="112" fill="#1c4f8f"/>
+  <path fill="#ffffff" d="M104 150 214 256 104 362l-34-36 72-70-72-70z"/>
+  <rect x="238" y="164" width="176" height="48" rx="24" fill="#ffffff"/>
+  <rect x="238" y="236" width="128" height="48" rx="24" fill="#ffffff"/>
+  <rect x="326" y="320" width="88" height="40" rx="20" fill="#ffffff"/>
+</svg>
