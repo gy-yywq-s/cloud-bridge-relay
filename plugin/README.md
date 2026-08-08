@@ -101,7 +101,12 @@ Every team has a shared board welded into the mail system:
   can't silently jam the team
 - `/crew:tasks` shows the board; the roster shows who holds how many tasks
 
-Watch it live from any terminal:
+Watch it live:
+
+- **Browser** — open https://board.gaelis.cc and enter your team's view key
+  (shown when setup completes; any session can repeat it via `board_key`).
+  Read-only, one key per team, auto-refreshes.
+- **Terminal** —
 
 ```bash
 curl -s https://crew.gaelis.cc/client/board -o crew-board.sh
