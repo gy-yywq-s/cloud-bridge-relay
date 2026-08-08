@@ -43,6 +43,7 @@ from pathlib import Path
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -1159,7 +1160,7 @@ def prompt_status() -> str:
 
 # ---------------- MCP tools ----------------
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def register_box(platform: str, environment: str, pool_code: str,
                        session_name: str = "", box_id: str = "",
                        role: str = "", override_name: bool = False) -> dict:
@@ -1180,14 +1181,14 @@ async def register_box(platform: str, environment: str, pool_code: str,
                        role, override_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def watch_pool(pool_code: str) -> dict:
     """See who is waiting in a pool. If told to monitor, call periodically and
     report; when the owner says 'initialize', call initialize_team."""
     return do_pool(pool_code)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def initialize_team(pool_code: str, coordinator_box: str) -> dict:
     """Turn the whole waiting pool into a team. Call ONLY on the owner's word
     'initialize'. You become coordinator (#1); a unique team id (tm-xxxxxx)
@@ -1195,19 +1196,19 @@ async def initialize_team(pool_code: str, coordinator_box: str) -> dict:
     return do_initialize_team(pool_code, coordinator_box)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def join_team(code: str, box: str) -> dict:
     """Join an existing team late (register_box first). Broadcasts the update."""
     return do_join_team(code, box)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_team_name(code: str, name: str) -> dict:
     """Setup center: set the team name the owner chose. Broadcasts."""
     return do_set_team_name(code, name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_member_alias(code: str, member_no: int, alias: str,
                            override_name: bool = False) -> dict:
     """Setup center: set the alias the owner chose for one member. Duplicate
@@ -1216,14 +1217,14 @@ async def set_member_alias(code: str, member_no: int, alias: str,
     return do_set_member_alias(code, member_no, alias, override_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_box_role(code: str, member_no: int, role: str) -> dict:
     """Setup center: mark a member 'manager' or 'worker' (owner's choice).
     HARD consequence: workers can never mail the owner. Broadcasts."""
     return do_set_box_role(code, member_no, role)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def setup_owner_mailbox(full_name: str, email: str, alias: str = "") -> dict:
     """Create OR edit the owner mailbox. Same verified email = name/alias
     update only, instant. New/changed email = a verification mail is sent and
@@ -1232,14 +1233,14 @@ async def setup_owner_mailbox(full_name: str, email: str, alias: str = "") -> di
     return await asyncio.to_thread(do_setup_owner, full_name, alias, email)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def confirm_owner_mailbox(override: bool = False) -> dict:
     """Owner mailbox step 2: call ONLY after the owner says the verification
     email arrived (or explicitly says 'override' after a reported failure)."""
     return do_confirm_owner(override)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_owner_mode(mode: str, custom_rules: str = "",
                          allow_senders: str = "", allow_direct: str = "",
                          persistent: bool | None = None) -> dict:
@@ -1252,14 +1253,14 @@ async def set_owner_mode(mode: str, custom_rules: str = "",
                              persistent)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def attach_owner_to_team(code: str) -> dict:
     """Setup center: attach the confirmed owner mailbox to a team as member #0
     (owner + human). Broadcasts the owner contact rules to everyone."""
     return do_attach_owner(code)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def list_team(code: str, view: str = "brief") -> dict:
     """Team roster for a team id (tm-xxxxxx). view="brief" (default): one
     line per member — number, name, box, role, platform — enough for
@@ -1268,7 +1269,7 @@ async def list_team(code: str, view: str = "brief") -> dict:
     return team_roster(str(code), view if view in ("brief", "full") else "brief")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def send_mail(sender_box: str, to: list[str], body: str,
                     cc: list[str] | None = None,
                     owner_justification: str = "",
@@ -1289,7 +1290,7 @@ async def send_mail(sender_box: str, to: list[str], body: str,
     return res if res else err
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def check_mail(box: str, wait_seconds: int = 25,
                      ack_through: int = 0) -> list[dict]:
     """Long-poll your mailbox — ACK MODEL, read this once:
@@ -1309,7 +1310,7 @@ async def check_mail(box: str, wait_seconds: int = 25,
     return await do_poll(box, wait_seconds, take=False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def ack_mail(box: str, through_id: int) -> dict:
     """Acknowledge processed mail: marks everything with id <= through_id as
     done for your box. Idempotent; re-acking is a no-op. Acked mail stays in
@@ -1319,7 +1320,7 @@ async def ack_mail(box: str, through_id: int) -> dict:
     return do_ack(box, through_id)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def peek_mail(box: str) -> list[dict]:
     """Look at pending messages without taking them."""
     if not BOX_RE.match(box):
@@ -1327,14 +1328,14 @@ async def peek_mail(box: str) -> list[dict]:
     return fetch_box(box, take=False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def list_boxes() -> dict:
     """Directory of all boxes: display name, platform/human, role, team,
     pending count, last_seen."""
     return do_boxes()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def mail_history(box: str, limit: int = 50) -> dict:
     """Audit trail: received (taken_ts null = pending; email_status for
     owner-bound mail) and sent messages. Kept ~14 days."""
