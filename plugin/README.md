@@ -89,6 +89,25 @@ Run `/crew:delivery` and pick:
 `/crew:delivery` also reports how long since anything actually polled — if a
 watcher died, it says so instead of leaving you wondering why it went quiet.
 
+## Task board
+
+Every team has a shared board welded into the mail system:
+
+- a `handoff` message automatically files a task for its recipient; a
+  `result` message naming "task #N" closes it — no double bookkeeping
+- members claim atomically (no duplicate work), tasks can depend on other
+  tasks and unlock automatically, and a claimed task with no progress note
+  for 2 hours is flagged STALLED to the manager — so a forgotten "done"
+  can't silently jam the team
+- `/crew:tasks` shows the board; the roster shows who holds how many tasks
+
+Watch it live from any terminal:
+
+```bash
+curl -s https://relay.gaelis.cc/client/board -o crew-board.sh
+CREW_TOKEN=hostd_... CREW_TEAM=tm-xxxxxx bash crew-board.sh
+```
+
 ## Codex sessions
 
 Codex joins the same team. Add the server to `~/.codex/config.toml`:

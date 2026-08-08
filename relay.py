@@ -57,7 +57,8 @@ MAX_WAIT = 55
 PRUNE_DAYS = 14
 RATE_N = 30           # max sends per box...
 RATE_WINDOW = 300     # ...per this many seconds; hard refusal, never silent
-STALE_AFTER = 600     # teamed agent silent for this long -> flagged, manager told
+STALE_AFTER = 600
+TASK_STALL_AFTER = 7200   # claimed task silent this long -> stalled, manager told     # teamed agent silent for this long -> flagged, manager told
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 CODE_RE = re.compile(r"^\d{4}$")
 PLATFORMS = ("claude-code", "codex")
@@ -131,6 +132,14 @@ def init_db():
       code TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
       pool_code TEXT NOT NULL DEFAULT '',
       coordinator TEXT NOT NULL, created_ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS tasks(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      team TEXT NOT NULL, title TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+      deps TEXT NOT NULL DEFAULT '[]', owner TEXT, status TEXT NOT NULL DEFAULT 'open',
+      priority INTEGER NOT NULL DEFAULT 2, result TEXT NOT NULL DEFAULT '',
+      last_note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
+      discovered_from INTEGER, stalled INTEGER NOT NULL DEFAULT 0,
+      created_ts TEXT NOT NULL, updated_ts TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS setup_state(
       team_code TEXT PRIMARY KEY, step_id TEXT NOT NULL DEFAULT '',
       answers TEXT NOT NULL DEFAULT '{}', done INTEGER NOT NULL DEFAULT 0,
@@ -884,6 +893,10 @@ def roster_text(code):
         tail = []
         if pending:
             tail.append(f"{pending} unread")
+        ntasks = db().execute("SELECT count(*) n FROM tasks WHERE owner=? AND "
+                              "status='claimed'", (r["box"],)).fetchone()["n"]
+        if ntasks:
+            tail.append(f"{ntasks} task{'s' if ntasks > 1 else ''}")
         if r["stale"]:
             tail.append("STALE — not polling")
         lines.append("  " + " · ".join(bits) +
@@ -1110,13 +1123,17 @@ def stale_sweep():
             db().execute("UPDATE boxes SET stale=1 WHERE box=?", (b["box"],))
             db().commit()
             if mgr and mgr != b["box"]:
+                held = [f"#{t['id']} {t['title']}" for t in db().execute(
+                    "SELECT id,title FROM tasks WHERE owner=? AND status='claimed'",
+                    (b["box"],))]
+                extra = (" They hold claimed tasks: " + "; ".join(held) +
+                         " — reassign with task_done or a new task if needed."
+                         if held else "")
                 system_mail(mgr,
                             f"MEMBER STALE: {display_name(b)} (box {b['box']}, "
                             f"#{b['member_no']}) has not polled for "
                             f"{int(idle // 60)} min. Work assigned to them may "
-                            "be sitting unread. Consider reassigning or "
-                            "flagging it to the owner if it blocks a "
-                            "milestone.")
+                            f"be sitting unread.{extra}")
         elif idle <= STALE_AFTER and b["stale"]:
             db().execute("UPDATE boxes SET stale=0 WHERE box=?", (b["box"],))
             db().commit()
@@ -1129,6 +1146,10 @@ def stale_loop():
     while True:
         try:
             stale_sweep()
+        except Exception:
+            pass
+        try:
+            task_stall_sweep()
         except Exception:
             pass
         time.sleep(60)
@@ -1192,6 +1213,289 @@ def find_team_by_pool(pool_code):
     r = db().execute("SELECT code FROM teams WHERE pool_code=? "
                      "ORDER BY created_ts DESC LIMIT 1", (str(pool_code),)).fetchone()
     return r["code"] if r else None
+
+
+
+# ---------------- task board ------------------------------------------------
+# Design distilled from agent-teams, the harness task tools, and beads:
+#   - atomic claim (no two members grab the same work)
+#   - ready-work detection: deps are ids that must all be done first; deps may
+#     only reference EXISTING tasks, so the graph is a DAG by construction
+#   - anti-drift: board lives in the same SQLite as mail, survives everything
+#   - anti-"forgot to mark done": claimed tasks go STALLED after silence and
+#     the manager is told (the documented agent-teams failure mode)
+#   - discovered work: file it with discovered_from instead of doing it now
+
+def task_row(tid):
+    return db().execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+
+
+def task_deps_done(t):
+    deps = json.loads(t["deps"])
+    if not deps:
+        return True
+    rows = db().execute(
+        "SELECT count(*) n FROM tasks WHERE id IN (%s) AND status='done'"
+        % ",".join("?" * len(deps)), deps).fetchone()
+    return rows["n"] == len(deps)
+
+
+def team_agent_boxes(code):
+    return [r["box"] for r in db().execute(
+        "SELECT box FROM boxes WHERE team_code=? AND is_human=0", (code,))]
+
+
+def do_task_add(team, title, detail, created_by, deps=None, assign_to="",
+                priority=2, discovered_from=None):
+    team = str(team)
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (team,)).fetchone():
+        return {"error": "no_such_team"}
+    if not str(title).strip():
+        return {"error": "empty_title"}
+    deps = deps or []
+    if not isinstance(deps, list):
+        return {"error": "bad_deps", "detail": "deps is a list of task ids"}
+    try:
+        deps = [int(d) for d in deps]
+    except (TypeError, ValueError):
+        return {"error": "bad_deps"}
+    for d in deps:
+        r = task_row(d)
+        if not r or r["team"] != team:
+            return {"error": "bad_deps", "detail": f"no task #{d} in this team"}
+    if assign_to:
+        a = box_row(assign_to)
+        if not a or a["team_code"] != team:
+            return {"error": "bad_assignee",
+                    "detail": "assign_to must be a member box of this team"}
+    try:
+        priority = int(priority)
+        assert priority in (1, 2, 3)
+    except (AssertionError, TypeError, ValueError):
+        return {"error": "bad_priority", "detail": "1=high 2=normal 3=low"}
+    if discovered_from is not None and not task_row(discovered_from):
+        return {"error": "bad_discovered_from"}
+    cur = db().execute(
+        "INSERT INTO tasks(team,title,detail,deps,owner,status,priority,"
+        "created_by,discovered_from,created_ts,updated_ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (team, str(title)[:200], str(detail)[:2000], json.dumps(deps),
+         assign_to or None, "open", priority, created_by, discovered_from,
+         now(), now()))
+    db().commit()
+    tid = cur.lastrowid
+    t = task_row(tid)
+    if assign_to and task_deps_done(t):
+        system_mail(assign_to,
+                    f"TASK ASSIGNED: #{tid} \"{title}\" is reserved for you "
+                    f"and ready now. Claim it with task_claim({tid}, "
+                    f"your_box) when you start.")
+    return {"ok": True, "task_id": tid,
+            "ready": task_deps_done(t) and not assign_to,
+            "reserved_for": assign_to or None}
+
+
+def do_task_claim(tid, box):
+    t = task_row(tid)
+    if not t:
+        return {"error": "no_such_task"}
+    b = box_row(box)
+    if not b or b["team_code"] != t["team"]:
+        return {"error": "not_a_member"}
+    if t["status"] == "done":
+        return {"error": "already_done"}
+    if t["status"] == "claimed":
+        return {"error": "already_claimed", "by": t["owner"],
+                "directive": ("Someone beat you to it. Call task_list to pick "
+                              "another ready task — do NOT start this one.")}
+    if t["owner"] and t["owner"] != box:
+        return {"error": "reserved", "for": t["owner"]}
+    if not task_deps_done(t):
+        return {"error": "blocked",
+                "deps": [d for d in json.loads(t["deps"])
+                         if (task_row(d) or {"status": ""})["status"] != "done"]}
+    cur = db().execute(
+        "UPDATE tasks SET owner=?, status='claimed', stalled=0, updated_ts=? "
+        "WHERE id=? AND status='open' AND (owner IS NULL OR owner=?)",
+        (box, now(), tid, box))
+    db().commit()
+    if cur.rowcount == 0:   # lost the race atomically
+        t = task_row(tid)
+        return {"error": "already_claimed", "by": t["owner"],
+                "directive": "Someone beat you to it; pick another ready task."}
+    return {"ok": True, "task_id": tid, "title": t["title"],
+            "detail": t["detail"],
+            "directive": ("Task claimed. Work it; call task_progress with a "
+                          "one-line note at least every hour so it never "
+                          "shows as stalled, and task_done(result=...) the "
+                          "moment it is finished — unfinished-looking done "
+                          "work is the #1 way agent teams jam.")}
+
+
+def do_task_progress(tid, box, note):
+    t = task_row(tid)
+    if not t:
+        return {"error": "no_such_task"}
+    if t["owner"] != box or t["status"] != "claimed":
+        return {"error": "not_yours"}
+    db().execute("UPDATE tasks SET last_note=?, stalled=0, updated_ts=? WHERE id=?",
+                 (str(note)[:300], now(), tid))
+    db().commit()
+    return {"ok": True}
+
+
+def do_task_done(tid, box, result):
+    t = task_row(tid)
+    if not t:
+        return {"error": "no_such_task"}
+    b = box_row(box)
+    is_mgr = b and b["team_code"] == t["team"] and b["role"] == "manager"
+    if t["owner"] != box and not is_mgr:
+        return {"error": "not_yours",
+                "detail": "only the claimer or the manager may close a task"}
+    if t["status"] == "done":
+        return {"ok": True, "already": True}
+    db().execute("UPDATE tasks SET status='done', result=?, stalled=0, "
+                 "updated_ts=? WHERE id=?", (str(result)[:1000], now(), tid))
+    db().commit()
+    unlocked = []
+    for r in db().execute("SELECT * FROM tasks WHERE team=? AND status='open'",
+                          (t["team"],)):
+        if tid in json.loads(r["deps"]) and task_deps_done(r):
+            unlocked.append(r)
+    for r in unlocked:
+        if r["owner"]:
+            system_mail(r["owner"],
+                        f"TASK UNBLOCKED: #{r['id']} \"{r['title']}\" was "
+                        f"waiting on #{tid} and is now ready. It is reserved "
+                        f"for you — claim it when you start.")
+        else:
+            mgr = team_manager_box(t["team"])
+            if mgr:
+                system_mail(mgr,
+                            f"TASK UNBLOCKED: #{r['id']} \"{r['title']}\" is "
+                            f"now ready and unassigned. Assign it or let "
+                            f"someone self-claim.")
+    nxt = [dict(id=r["id"], title=r["title"]) for r in db().execute(
+        "SELECT * FROM tasks WHERE team=? AND status='open' ORDER BY priority, id",
+        (t["team"],)) if task_deps_done(r) and (not r["owner"] or r["owner"] == box)]
+    return {"ok": True, "task_id": tid, "unblocked": [r["id"] for r in unlocked],
+            "next_ready": nxt[:5],
+            "directive": ("Task closed. SELF-CLAIM RULE: if next_ready lists "
+                          "anything, claim one and keep working; only go idle "
+                          "when it is empty. Check mail first in case "
+                          "priorities changed.")}
+
+
+
+def mail_task_hook(sender, to, template, fields):
+    """Mail and board stay one system: a handoff files a task for the
+    recipient; a result naming 'task #N' closes it."""
+    b = box_row(sender)
+    if not (b and b["team_code"]):
+        return {}
+    team = b["team_code"]
+    if template == "handoff":
+        assignee = ""
+        for r in to:
+            rb = box_row(r)
+            if rb and rb["team_code"] == team:
+                assignee = r
+                break
+        r = do_task_add(team, fields.get("task", "")[:200],
+                        (fields.get("context", "") + "\ndeliverable: " +
+                         fields.get("deliverable", ""))[:2000],
+                        sender, None, assignee)
+        if r.get("ok"):
+            return {"task_id": r["task_id"],
+                    "task_note": f"task #{r['task_id']} auto-created for this "
+                                 "handoff; recipient should task_claim it"}
+    if template == "result":
+        m = re.search(r"#?(\d+)", str(fields.get("task", "")))
+        if m:
+            t = task_row(int(m.group(1)))
+            if t and t["team"] == team and t["status"] != "done":
+                r = do_task_done(int(m.group(1)), sender,
+                                 fields.get("outcome", "")[:200])
+                if r.get("ok"):
+                    return {"task_closed": t["id"],
+                            "next_ready": r.get("next_ready", [])}
+    return {}
+
+
+def board_text(team):
+    """Canonical task board rendering — same everywhere (tool, TUI, web)."""
+    rows = db().execute("SELECT * FROM tasks WHERE team=? ORDER BY priority, id",
+                        (team,)).fetchall()
+    if not rows:
+        return f"task board · {team}\n  (no tasks yet — task_add to create one)"
+    P = {1: "high", 2: "", 3: "low"}
+    ready, working, blocked, done = [], [], [], []
+    for t in rows:
+        pr = f" !{P[t['priority']]}" if t["priority"] == 1 else \
+             (" ~low" if t["priority"] == 3 else "")
+        if t["status"] == "done":
+            done.append(f"  ✓ #{t['id']} {t['title']}"
+                        + (f" — {t['result'][:60]}" if t["result"] else ""))
+        elif t["status"] == "claimed":
+            age = ""
+            try:
+                mins = int((datetime.now(timezone.utc) -
+                            datetime.fromisoformat(t["updated_ts"])).total_seconds() // 60)
+                age = f", {mins}m since update"
+            except Exception:
+                pass
+            o = box_row(t["owner"])
+            who = display_name(o) if o else t["owner"]
+            flag = " ⚠STALLED" if t["stalled"] else ""
+            note = f" — {t['last_note']}" if t["last_note"] else ""
+            working.append(f"  ▶ #{t['id']}{pr} {t['title']} ({who}{age}){flag}{note}")
+        elif task_deps_done(t):
+            tag = f" [reserved: {t['owner']}]" if t["owner"] else ""
+            ready.append(f"  ○ #{t['id']}{pr} {t['title']}{tag}")
+        else:
+            pend = [str(d) for d in json.loads(t["deps"])
+                    if (task_row(d) or {"status": ""})["status"] != "done"]
+            blocked.append(f"  ⊘ #{t['id']}{pr} {t['title']} (waiting on #"
+                           + ", #".join(pend) + ")")
+    out = [f"task board · {team}"]
+    if ready:
+        out.append("READY TO CLAIM:")
+        out += ready
+    if working:
+        out.append("IN PROGRESS:")
+        out += working
+    if blocked:
+        out.append("BLOCKED:")
+        out += blocked
+    if done:
+        out.append(f"DONE ({len(done)}):")
+        out += done[-5:]
+    return "\n".join(out)
+
+
+def task_stall_sweep():
+    """Claimed tasks silent too long -> stalled + manager notice. Fixes the
+    documented agent-teams jam where a forgotten 'done' blocks everyone."""
+    now_dt = datetime.now(timezone.utc)
+    for t in db().execute("SELECT * FROM tasks WHERE status='claimed' AND stalled=0"):
+        try:
+            idle = (now_dt - datetime.fromisoformat(t["updated_ts"])).total_seconds()
+        except Exception:
+            continue
+        if idle > TASK_STALL_AFTER:
+            db().execute("UPDATE tasks SET stalled=1 WHERE id=?", (t["id"],))
+            db().commit()
+            mgr = team_manager_box(t["team"])
+            o = box_row(t["owner"])
+            for target in {mgr, t["owner"]} - {None}:
+                system_mail(target,
+                            f"TASK STALLED: #{t['id']} \"{t['title']}\" "
+                            f"(claimed by {display_name(o) if o else t['owner']}) "
+                            f"has had no progress note for "
+                            f"{int(idle // 3600)}h+. If it is actually done, "
+                            f"close it with task_done; if abandoned, the "
+                            f"manager should reassign it.")
 
 
 # ---------------- message templates (structure, not prose) -----------------
@@ -1789,6 +2093,50 @@ h1{{font-size:20px}}</style>
 {"".join(rows) or "<p>No mail yet.</p>"}"""
 
 
+
+BOARD_SH = r'''#!/usr/bin/env bash
+# crew live task board in your terminal. Refreshes every 5s.
+#   export CREW_TOKEN=hostd_...   CREW_TEAM=tm-xxxxxx
+#   curl -s https://relay.gaelis.cc/client/board -o crew-board.sh && bash crew-board.sh
+set -u
+: "${CREW_TOKEN:?export CREW_TOKEN first}" "${CREW_TEAM:?export CREW_TEAM first}"
+CREW_URL="${CREW_URL:-https://relay.gaelis.cc}"
+while true; do
+  OUT=$(curl -s -A crew-board -H "Authorization: Bearer $CREW_TOKEN" \
+    "$CREW_URL/tasks?team=$CREW_TEAM" 2>/dev/null)
+  clear
+  printf '%s' "$OUT" | python3 -c '
+import json, sys, datetime
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("crew board: relay unreachable, retrying..."); raise SystemExit
+print(d.get("board", d.get("error", "?")))
+print()
+print(d.get("roster", ""))
+print()
+print("refreshed", datetime.datetime.now().strftime("%H:%M:%S"), "· ctrl-c to quit")
+'
+  sleep 5
+done
+'''
+
+
+def board_html(team):
+    import html as h
+    text = board_text(team)
+    roster = roster_text(team)
+    body = h.escape(text) + "\n\n" + h.escape(roster)
+    return f"""<!doctype html><meta charset=utf-8>
+<meta http-equiv=refresh content=10>
+<title>crew board · {h.escape(team)}</title>
+<style>body{{background:#14181b;color:#e7e9ea;font:14px/1.7 ui-monospace,Menlo,monospace;
+max-width:820px;margin:32px auto;padding:0 20px}}
+pre{{white-space:pre-wrap}}
+.r{{color:#4fbe84}} .w{{color:#5ea8dc}} .b{{color:#8c949c}} .s{{color:#f0855a}}</style>
+<pre>{body}</pre>
+<p style="color:#5e646e">auto-refreshes every 10s</p>"""
+
 USAGE = {
     "service": "crew",
     "v": 5.1,
@@ -1864,6 +2212,10 @@ USAGE = {
         "GET /history?box=X&limit=N": "audit trail (~14 days)",
         "GET /thread?id=N": "whole conversation chain around one message",
         "GET /audit?box=X": "human-readable audit page (open in a browser)",
+        "GET /tasks?team=X": "task board JSON (tasks + rendered board + roster)",
+        "POST /task/add|claim|progress|done": "task board mirror of the MCP tools",
+        "GET /board?team=X": "auto-refreshing board page",
+        "GET /client/board": "terminal live-board script (CREW_TOKEN+CREW_TEAM)",
     },
     "box_name_rule": BOX_RE.pattern,
 }
@@ -2157,7 +2509,10 @@ async def send_mail(sender_box: str, to: list[str], template: str = "note",
       handoff(task,context,deliverable) · result(task,outcome) ·
       note(free text in body)
     Missing required fields are refused with the list. `body` is optional
-    extra prose appended under the structured part. Replying? Pass reply_to=
+    extra prose appended under the structured part. BOARD WELDING: a
+    `handoff` auto-creates a board task reserved for the first teamed
+    recipient (response carries task_id); a `result` whose `task` field names
+    "#N" auto-closes that task. Replying? Pass reply_to=
     <the message id> so the exchange stays a thread (mail_thread follows it).
     Sends are rate-limited (~30 per 5 min per box); a refusal names the wait
     and means the message was NOT sent — never assume delivery after an error.
@@ -2178,7 +2533,10 @@ async def send_mail(sender_box: str, to: list[str], template: str = "note",
     res, err = do_send(sender_box, to, cc or [], rendered,
                        owner_justification=owner_justification,
                        dedup_key=dedup_key, reply_to=reply_to)
-    return res if res else err
+    if err:
+        return err
+    res.update(mail_task_hook(sender_box, to, template, fields or {}))
+    return res
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -2244,6 +2602,61 @@ async def list_boxes() -> dict:
     """Directory of all boxes: display name, platform/human, role, team,
     pending count, last_seen."""
     return do_boxes()
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def task_add(team: str, title: str, detail: str = "",
+                   created_by: str = "", deps: list[int] | None = None,
+                   assign_to: str = "", priority: int = 2,
+                   discovered_from: int | None = None) -> dict:
+    """Add a task to the team board.
+
+    Right-sized task = a self-contained deliverable (a function, a test file,
+    a review), not a whole feature and not a one-liner; aim for 5-6 open
+    tasks per member. deps = ids that must be DONE first (they must already
+    exist, so the graph stays acyclic). assign_to reserves it for one box;
+    otherwise anyone may claim once ready. priority 1=high 2=normal 3=low.
+    FILING DISCOVERED WORK: if you notice work while doing something else, do
+    NOT chase it — add it here with discovered_from=<your current task id>
+    and keep going."""
+    return do_task_add(team, title, detail, created_by, deps, assign_to,
+                       priority, discovered_from)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def task_claim(task_id: int, box: str) -> dict:
+    """Claim a ready task before working on it. Atomic: exactly one member
+    wins; a refusal means pick another from task_list, never work an
+    unclaimed or lost task. Blocked/reserved tasks tell you why."""
+    return do_task_claim(task_id, box)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def task_progress(task_id: int, box: str, note: str) -> dict:
+    """One-line progress note on your claimed task. Do it at least hourly —
+    silence past 2h marks the task STALLED
+    and pings the manager."""
+    return do_task_progress(task_id, box, note)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def task_done(task_id: int, box: str, result: str) -> dict:
+    """Close your task with a one-line result THE MOMENT it is finished —
+    a forgotten close blocks every dependent task and jams the team.
+    Response lists what you unblocked and what is ready next: SELF-CLAIM the
+    next ready task instead of going idle."""
+    return do_task_done(task_id, box, result)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def task_list(team: str) -> dict:
+    """The team task board: READY / IN PROGRESS (with owner, age, stalled
+    flags) / BLOCKED (with what they wait on) / DONE. Returns say_to_owner —
+    relay it verbatim when the human asked; use the sections yourself to pick
+    work (claim from READY only)."""
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (str(team),)).fetchone():
+        return {"error": "no_such_team"}
+    return {"say_to_owner": board_text(str(team)), "relay_rule": RELAY_RULE}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -2401,7 +2814,11 @@ async def _r_send(_req, p):
                        owner_justification=p.get("owner_justification", ""),
                        dedup_key=p.get("dedup_key", ""),
                        reply_to=p.get("reply_to"))
-    return res if res else err
+    if err:
+        return err
+    res.update(mail_task_hook(p.get("from", ""), as_box_list(p.get("to")) or [],
+                              p.get("template", "note"), p.get("fields") or {}))
+    return res
 
 
 async def _r_poll(req, _p):
@@ -2467,6 +2884,48 @@ async def _r_audit(req):
     return HTMLResponse(audit_html(box, min(max(limit, 1), 500)))
 
 
+async def _r_tasks(req, _p):
+    team = req.query_params.get("team", "")
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (team,)).fetchone():
+        return {"error": "no_such_team"}
+    rows = [dict(r) for r in db().execute(
+        "SELECT * FROM tasks WHERE team=? ORDER BY priority, id", (team,))]
+    return {"team": team, "tasks": rows, "board": board_text(team),
+            "roster": roster_text(team)}
+
+
+async def _r_task_add(_req, p):
+    return do_task_add(p.get("team", ""), p.get("title", ""),
+                       p.get("detail", ""), p.get("created_by", ""),
+                       p.get("deps"), p.get("assign_to", ""),
+                       p.get("priority", 2), p.get("discovered_from"))
+
+
+async def _r_task_claim(_req, p):
+    return do_task_claim(p.get("task_id"), p.get("box", ""))
+
+
+async def _r_task_progress(_req, p):
+    return do_task_progress(p.get("task_id"), p.get("box", ""), p.get("note", ""))
+
+
+async def _r_task_done(_req, p):
+    return do_task_done(p.get("task_id"), p.get("box", ""), p.get("result", ""))
+
+
+async def _r_board_page(req):
+    from starlette.responses import HTMLResponse
+    team = req.query_params.get("team", "")
+    if not db().execute("SELECT 1 FROM teams WHERE code=?", (team,)).fetchone():
+        return HTMLResponse("<p>no such team</p>", status_code=404)
+    return HTMLResponse(board_html(team))
+
+
+async def _r_board_sh(_req):
+    from starlette.responses import PlainTextResponse
+    return PlainTextResponse(BOARD_SH)
+
+
 async def _r_history(req, _p):
     box = req.query_params.get("box", "")
     if not BOX_RE.match(box):
@@ -2509,6 +2968,13 @@ app.router.routes.extend([
     Route("/history", _json_route(_r_history)),
     Route("/thread", _json_route(_r_thread)),
     Route("/audit", _r_audit),
+    Route("/tasks", _json_route(_r_tasks)),
+    Route("/task/add", _json_route(_r_task_add), methods=["POST"]),
+    Route("/task/claim", _json_route(_r_task_claim), methods=["POST"]),
+    Route("/task/progress", _json_route(_r_task_progress), methods=["POST"]),
+    Route("/task/done", _json_route(_r_task_done), methods=["POST"]),
+    Route("/board", _r_board_page),
+    Route("/client/board", _r_board_sh),
 ])
 
 if __name__ == "__main__":
