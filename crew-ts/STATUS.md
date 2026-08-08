@@ -1,9 +1,9 @@
 # crew-ts — status & deploy runbook
 
-TypeScript rewrite of crew, for release. **The software is complete and tested
-in local + private mode.** What remains is the droplet deploy, which blocks on
-inputs only Gary can supply (a GitHub OAuth app, the domain cutover decision),
-plus cloud multi-tenancy (see Known gaps).
+TypeScript rewrite of crew, for release. **Complete and tested in local, private,
+and cloud (multi-tenant) mode, and deployed** to staging at
+`https://crew-ts.gaelisus.com` (private mode) on codex-droplet. Cloud multi-tenant
+isolation is built, tested (27/27 e2e), and security-reviewed twice.
 
 ## Done + tested
 
@@ -21,7 +21,24 @@ plus cloud multi-tenancy (see Known gaps).
 - **MCP**: 34 tools + onboard/setup prompts + **spawn_guide**.
 - **OAuth 2.1 AS**: DCR + PKCE + code/token/refresh/revoke, SQLite-backed,
   served by `mcpAuthRouter`. Data plane (`/mcp`, `/api/*`) gated by bearer when
-  mode≠local; static tokens + deployer password for private mode.
+  mode≠local; static tokens + deployer password for private mode. **Explicit
+  consent screen + double-submit CSRF** before any authorization code is minted
+  (no code is ever issued on a GET).
+- **Cloud multi-tenancy (database-per-tenant)**: each account gets a physically
+  separate SQLite file (`data/tenants/<id>/crew.db`); control plane (accounts,
+  OAuth, invites) stays in the shared `crew.db`. `tenantCtx()` is the single
+  routing point — every request's business logic runs against the Ctx scoped to
+  the accountId from its verified bearer, so isolation is structural, not a
+  forgettable WHERE filter. LRU-bounded handle cache. private/local remain one
+  shared trust domain (tenantCtx returns the shared Ctx).
+- **Invite-gated open registration**: single-use (atomic consume) / multi-use /
+  expiring codes, minted by admins. Admins bootstrap without an invite; the very
+  first admin is seeded by `scripts/bootstrap-admin.mjs` (operator/file access)
+  or a GitHub-verified admin email — never from a self-asserted signup email.
+- **Admin console** (`/admin`, cloud): aggregate activity only (accounts, active
+  users, per-account team/agent/message counts + last-active) — never message or
+  task content — plus invite generation/disable. Admin status requires a proven
+  email (GitHub-verified or operator bootstrap).
 - **Web UI** (ode design, **single swappable `--accent`**, pure-white surface,
   light+dark): `/login` (email+password, GitHub, deployer), `/signup`
   (gated by open_registration), `/app` dashboard (teams, pools, sessions,
@@ -68,17 +85,22 @@ Then connect the three clients to `https://crew-ts.gaelisus.com/mcp` (OAuth) and
 run the live cross-platform + spawn tests. Only after that, flip
 `crew.gaelisus.com` DNS to the TS tunnel and migrate/retire the Python relay.
 
-## Known gaps (must close before public cloud)
+## Known gaps
 
-- **Cloud multi-tenancy is NOT implemented.** teams/boxes/tasks/mail are global;
-  with `open_registration=true` every registered stranger can read every team.
-  `private` mode (single trust domain — Gary's own cross-device use, and the
-  "anyone self-hosts their own" case) is fine as-is. Cloud needs account_id
-  scoping on every query (columns already exist). Do this before exposing
-  cloud publicly.
-- **Second security review** of auth/web is running; apply findings.
 - **Elicitation** (native setup form) not yet ported to TS (batch fallback works).
-- Live 3-client + spawn e2e pending the deploy.
+- Live 3-client + spawn e2e over the public OAuth flow still to be run by Gary
+  (machinery verified; the browser-login step is interactive).
+
+## Security reviews (both applied)
+
+1. auth/web layer: anonymous-token-mint (separate oauth_pending table),
+   refresh-as-bearer, refresh rotation, redirect_uri binding, JWT exp, esc.
+2. cloud multi-tenancy: **verdict — data-at-rest isolation sound** (separate
+   files, accountId always from the verified bearer, control plane fails closed,
+   static-token/deployer/null paths neutered in cloud). Two HIGH findings fixed:
+   (1) session→code auto-approve now behind consent + CSRF; (2) admin/invite
+   bypass no longer honored from an unverified email. Two LOW fixed (tenantDb
+   LRU; GitHub email-collision guard).
 
 ## Design notes carried forward
 

@@ -1,5 +1,14 @@
-// SQLite storage (better-sqlite3, synchronous). Schema mirrors the proven
-// Python relay plus tables for OAuth and web accounts.
+// SQLite storage (better-sqlite3, synchronous).
+//
+// Two schemas:
+//   • CONTROL plane (global): accounts, OAuth authorization-server state, invite
+//     codes. One database, shared by every tenant.
+//   • TENANT plane (per account in cloud mode): boxes, teams, mail, tasks, …
+//
+// local/private are a SINGLE trust domain: control + tenant tables live together
+// in one file and every request sees the same data. cloud mode gives EACH
+// account its own physically separate tenant database file — the strongest
+// isolation SQLite offers, so a query can never read another tenant's rows.
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -8,17 +17,78 @@ import type { Config } from "./config.js";
 
 export type DB = Database.Database;
 
-export function openDb(cfg: Config): DB {
+export function dataDir(cfg: Config): string {
   const dir = cfg.data_dir || process.env.CREW_DATA_DIR || join(homedir(), ".crew");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// Control database (+ tenant tables too, when the deployment is single-domain).
+export function openDb(cfg: Config): DB {
+  const db = new Database(join(dataDir(cfg), "crew.db"));
+  db.pragma("journal_mode = WAL");
+  db.pragma("busy_timeout = 5000");
+  migrateControl(db);
+  if (cfg.mode !== "cloud") migrateTenant(db); // single trust domain: one file
+  return db;
+}
+
+// A tenant's private business database (cloud mode). Created on first use.
+export function openTenantDb(cfg: Config, accountId: number): DB {
+  const dir = join(dataDir(cfg), "tenants", String(accountId));
   mkdirSync(dir, { recursive: true });
   const db = new Database(join(dir, "crew.db"));
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
-  migrate(db);
+  migrateTenant(db);
   return db;
 }
 
-function migrate(db: DB): void {
+// Add a column to an existing table if it is missing (SQLite has no
+// "ADD COLUMN IF NOT EXISTS"). Lets databases created by earlier versions pick
+// up new columns on restart — real migrations, not just CREATE IF NOT EXISTS.
+function addColumn(db: DB, table: string, column: string, decl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+}
+
+function migrateControl(db: DB): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS accounts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL, pw_hash TEXT,
+      github_id INTEGER, is_admin INTEGER NOT NULL DEFAULT 0,
+      display TEXT NOT NULL DEFAULT '', created_ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS oauth_clients(
+      client_id TEXT PRIMARY KEY, client_secret TEXT,
+      redirect_uris TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+      created_ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS oauth_codes(
+      code TEXT PRIMARY KEY, client_id TEXT NOT NULL, account_id INTEGER,
+      redirect_uri TEXT NOT NULL, code_challenge TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT '', expires_ts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS oauth_tokens(
+      token TEXT PRIMARY KEY, client_id TEXT NOT NULL, account_id INTEGER,
+      kind TEXT NOT NULL DEFAULT 'access',
+      scope TEXT NOT NULL DEFAULT '', expires_ts TEXT, created_ts TEXT NOT NULL);
+    -- pending (pre-login) authorizations live SEPARATELY from real codes so the
+    -- token endpoint can never consume one (security review finding 1).
+    CREATE TABLE IF NOT EXISTS oauth_pending(
+      pid TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+      code_challenge TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', expires_ts TEXT NOT NULL);
+    -- invite codes gate open registration (cloud mode).
+    CREATE TABLE IF NOT EXISTS invite_codes(
+      code TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '',
+      max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0,
+      created_by INTEGER, disabled INTEGER NOT NULL DEFAULT 0,
+      expires_ts TEXT, created_ts TEXT NOT NULL);
+  `);
+  // Upgrades: an accounts table created before these columns existed.
+  addColumn(db, "accounts", "github_id", "INTEGER");
+  addColumn(db, "accounts", "is_admin", "INTEGER NOT NULL DEFAULT 0");
+}
+
+function migrateTenant(db: DB): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,29 +146,6 @@ function migrate(db: DB): void {
       last_note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
       discovered_from INTEGER, stalled INTEGER NOT NULL DEFAULT 0,
       created_ts TEXT NOT NULL, updated_ts TEXT NOT NULL);
-
-    -- web accounts (cloud mode) + OAuth (authorization server state)
-    CREATE TABLE IF NOT EXISTS accounts(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT UNIQUE NOT NULL, pw_hash TEXT,
-      display TEXT NOT NULL DEFAULT '', created_ts TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS oauth_clients(
-      client_id TEXT PRIMARY KEY, client_secret TEXT,
-      redirect_uris TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
-      created_ts TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS oauth_codes(
-      code TEXT PRIMARY KEY, client_id TEXT NOT NULL, account_id INTEGER,
-      redirect_uri TEXT NOT NULL, code_challenge TEXT NOT NULL,
-      scope TEXT NOT NULL DEFAULT '', expires_ts TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS oauth_tokens(
-      token TEXT PRIMARY KEY, client_id TEXT NOT NULL, account_id INTEGER,
-      kind TEXT NOT NULL DEFAULT 'access',
-      scope TEXT NOT NULL DEFAULT '', expires_ts TEXT, created_ts TEXT NOT NULL);
-    -- pending (pre-login) authorizations live SEPARATELY from real codes so the
-    -- token endpoint can never consume one (security review finding 1).
-    CREATE TABLE IF NOT EXISTS oauth_pending(
-      pid TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
-      code_challenge TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', expires_ts TEXT NOT NULL);
   `);
 }
 

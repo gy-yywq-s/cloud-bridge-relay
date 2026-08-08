@@ -1,5 +1,11 @@
-// Entry point: load config, open db, build the MCP server + Hono app
+// Entry point: load config, open the control db, build the MCP server + Hono app
 // (MCP transport + REST mirror + health), start the sweeps, listen.
+//
+// Tenancy: requireAuth resolves the caller's accountId from their bearer token and
+// stores it on the request; T(ctx) then hands every handler a Ctx scoped to that
+// account's database (its own file in cloud mode, the shared db otherwise). No
+// handler ever touches another tenant's data because it never holds another
+// tenant's Ctx.
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { serve } from "@hono/node-server";
@@ -8,11 +14,14 @@ import { mcpAuthRouter } from "@hono/mcp/auth";
 import { provider as makeProvider } from "./auth/store.js";
 import { authRoutes } from "./auth/web.js";
 import { dashboardRoutes } from "./web/app.js";
+import { adminRoutes } from "./web/admin.js";
+import { reconcileAdmins } from "./auth/accounts.js";
 import { loadConfig } from "./config.js";
 import { openDb } from "./db.js";
 import { makeEmail } from "./core/email.js";
 import type { Ctx } from "./core/context.js";
 import { resolveViewKey, rosterText } from "./core/context.js";
+import { tenantCtx, listTenantIds } from "./core/tenancy.js";
 import { startSweeps } from "./core/sweeps.js";
 import { buildMcpServer } from "./mcp/server.js";
 import {
@@ -26,8 +35,9 @@ import { wizQuestions, wizAnswersBatch, wizNext, setupGuard } from "./core/wizar
 
 const cfg = loadConfig();
 const db = openDb(cfg);
-const ctx: Ctx = { db, cfg, email: makeEmail(cfg) };
-startSweeps(ctx);
+const ctrl: Ctx = { db, cfg, email: makeEmail(cfg) };
+reconcileAdmins(ctrl);
+startSweeps(ctrl, () => (cfg.mode === "cloud" ? listTenantIds(ctrl).map((id) => tenantCtx(ctrl, id)) : [ctrl]));
 
 // A rejected promise or thrown timer must never take the relay down.
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
@@ -35,45 +45,50 @@ process.on("uncaughtException", (err) => console.error("uncaughtException:", err
 
 if (cfg.mode !== "local" && !cfg.public_url)
   console.warn(`[crew] WARNING: mode='${cfg.mode}' needs public_url set for OAuth callbacks to work.`);
-// SAFETY INTERLOCK: cloud multi-tenant isolation is not implemented yet. Open
-// registration in cloud mode would let any stranger read every team's data, so
-// it is force-disabled until per-account scoping lands.
-if (cfg.mode === "cloud" && cfg.auth.open_registration) {
-  console.error("[crew] REFUSING open_registration in cloud mode: per-account data isolation is not yet implemented. Use mode='private' (single trust domain) for now. Open registration disabled.");
-  cfg.auth.open_registration = false;
-}
+if (cfg.mode === "cloud" && cfg.auth.open_registration && (cfg.auth.admin_emails || []).length === 0)
+  console.warn("[crew] WARNING: cloud open_registration is on but no admin_emails set — nobody can mint invite codes, so nobody can register. Set auth.admin_emails / CREW_ADMIN_EMAILS.");
 
-const app = new Hono();
+const app = new Hono<{ Variables: { accountId: number | null } }>();
 // Cap request bodies before they are buffered/parsed into memory.
 app.use("*", bodyLimit({ maxSize: cfg.limits.max_body * 2, onError: (c) => c.json({ error: "body_too_large" }, 413) }));
 app.get("/health", (c) => c.json({ ok: true, mode: cfg.mode, brand: cfg.brand.name }));
 
 // ── auth (private/cloud) ───────────────────────────────────────────────────
-const oauth = makeProvider(ctx);
-const staticTokens = new Map<string, string>(); // token -> label (private mode)
-for (const pair of (process.env[cfg.auth.static_tokens_env] || "").split(",").map((s) => s.trim()).filter(Boolean)) {
-  const [tok, ...lbl] = pair.split(":"); if (tok) staticTokens.set(tok, lbl.join(":") || "static");
+const oauth = makeProvider(ctrl);
+// Preset bearer tokens are a private-mode convenience (single trust domain).
+// They carry no account, so they must NOT be honored in cloud mode where every
+// request has to map to an isolated tenant.
+const staticTokens = new Map<string, string>();
+if (cfg.mode === "private") {
+  for (const pair of (process.env[cfg.auth.static_tokens_env] || "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    const [tok, ...lbl] = pair.split(":"); if (tok) staticTokens.set(tok, lbl.join(":") || "static");
+  }
 }
 if (cfg.mode !== "local") {
-  // Standard MCP authorization-server endpoints: metadata, DCR, /authorize, /token, revoke.
   app.route("/", mcpAuthRouter({ provider: oauth, issuerUrl: new URL(cfg.public_url || `http://localhost:${cfg.port}`), scopesSupported: ["crew"], resourceName: cfg.brand.name }));
-  app.route("/", authRoutes(ctx));
+  app.route("/", authRoutes(ctrl));
 }
 
-// Require a valid bearer (OAuth access token or configured static token) on the
-// data plane whenever the deployment is not local-only.
+// Require a valid bearer and stash the caller's accountId for tenant scoping.
 async function requireAuth(c: import("hono").Context, next: () => Promise<void>): Promise<Response | void> {
-  if (cfg.mode === "local") return next();
+  if (cfg.mode === "local") { c.set("accountId", null); return next(); }
   const auth = c.req.header("authorization") || "";
   const tok = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (tok && staticTokens.has(tok)) return next();
-  try { await oauth.verifyAccessToken(tok); return next(); }
-  catch { return c.json({ error: "unauthorized", detail: "present a valid Bearer token; connect via OAuth or a configured static token" }, 401); }
+  if (tok && staticTokens.has(tok)) { c.set("accountId", null); return next(); }
+  try {
+    const info = await oauth.verifyAccessToken(tok);
+    const acc = (info as { extra?: { accountId?: number } }).extra?.accountId;
+    c.set("accountId", acc ?? null);
+    return next();
+  } catch { return c.json({ error: "unauthorized", detail: "present a valid Bearer token; connect via OAuth or a configured static token" }, 401); }
 }
+
+// The tenant-scoped Ctx for the current request.
+const T = (c: import("hono").Context): Ctx => tenantCtx(ctrl, c.get("accountId"));
 
 // ── MCP endpoint (stateless per request) ──────────────────────────────────
 app.all("/mcp", requireAuth, async (c) => {
-  const server = buildMcpServer(ctx);
+  const server = buildMcpServer(T(c));
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c);
@@ -85,49 +100,51 @@ app.use("/api/*", requireAuth);
 const jz = (c: import("hono").Context, o: unknown) =>
   c.json(o as object, (o as { error?: string })?.error ? 400 : 200);
 
-app.post("/api/register", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doRegister(ctx, p.box_id ?? p.box ?? "", p.session_name ?? "", p.platform ?? "", p.environment ?? "", p.pool_code ?? "", p.role ?? "", !!p.override_name)); });
-app.get("/api/pool", (c) => jz(c, doPool(ctx, c.req.query("code") ?? "")));
-app.post("/api/team/create", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doInitializeTeam(ctx, p.pool_code ?? p.code ?? "", p.coordinator_box ?? "")); });
-app.post("/api/team/join", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doJoinTeam(ctx, p.code ?? "", p.box ?? "")); });
-app.post("/api/team/add-member", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doAddMember(ctx, p.code ?? "", p.session_name ?? "", p.platform ?? "", p.environment ?? "", p.role ?? "", !!p.override_name)); });
-app.post("/api/team/name", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? doSetTeamName(ctx, p.code ?? "", p.name ?? "")); });
-app.post("/api/team/alias", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? doSetMemberAlias(ctx, p.code ?? "", Number(p.member_no), p.alias ?? "", !!p.override_name)); });
-app.post("/api/team/role", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? doSetBoxRole(ctx, p.code ?? "", Number(p.member_no), p.role ?? "")); });
-app.post("/api/team/attach-owner", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? attachOwner(ctx, p.code ?? "")); });
-app.get("/api/team", (c) => jz(c, teamRoster(ctx, c.req.query("code") ?? "", c.req.query("view") === "full" ? "full" : "brief")));
-app.post("/api/setup/questions", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, wizQuestions(ctx, p.code ?? "", !!p.restart)); });
-app.post("/api/setup/answers", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, wizAnswersBatch(ctx, p.code ?? "", p.answers)); });
-app.post("/api/setup/next", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, wizNext(ctx, p.code ?? "", !!p.restart)); });
+app.post("/api/register", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doRegister(t, p.box_id ?? p.box ?? "", p.session_name ?? "", p.platform ?? "", p.environment ?? "", p.pool_code ?? "", p.role ?? "", !!p.override_name)); });
+app.get("/api/pool", (c) => jz(c, doPool(T(c), c.req.query("code") ?? "")));
+app.post("/api/team/create", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doInitializeTeam(t, p.pool_code ?? p.code ?? "", p.coordinator_box ?? "")); });
+app.post("/api/team/join", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doJoinTeam(t, p.code ?? "", p.box ?? "")); });
+app.post("/api/team/add-member", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doAddMember(t, p.code ?? "", p.session_name ?? "", p.platform ?? "", p.environment ?? "", p.role ?? "", !!p.override_name)); });
+app.post("/api/team/name", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(t, p.code ?? "") ?? doSetTeamName(t, p.code ?? "", p.name ?? "")); });
+app.post("/api/team/alias", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(t, p.code ?? "") ?? doSetMemberAlias(t, p.code ?? "", Number(p.member_no), p.alias ?? "", !!p.override_name)); });
+app.post("/api/team/role", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(t, p.code ?? "") ?? doSetBoxRole(t, p.code ?? "", Number(p.member_no), p.role ?? "")); });
+app.post("/api/team/attach-owner", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(t, p.code ?? "") ?? attachOwner(t, p.code ?? "")); });
+app.get("/api/team", (c) => jz(c, teamRoster(T(c), c.req.query("code") ?? "", c.req.query("view") === "full" ? "full" : "brief")));
+app.post("/api/setup/questions", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, wizQuestions(t, p.code ?? "", !!p.restart)); });
+app.post("/api/setup/answers", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, wizAnswersBatch(t, p.code ?? "", p.answers)); });
+app.post("/api/setup/next", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, wizNext(t, p.code ?? "", !!p.restart)); });
 
 app.post("/api/send", async (c) => {
+  const t = T(c);
   const p = await c.req.json().catch(() => ({}));
-  const [rendered, terr] = renderTemplate(ctx, p.template ?? "note", p.fields ?? {}, p.body ?? "");
+  const [rendered, terr] = renderTemplate(t, p.template ?? "note", p.fields ?? {}, p.body ?? "");
   if (terr) return jz(c, terr);
-  const [res, err] = doSend(ctx, p.from ?? "", p.to, p.cc, rendered!, { fallbackAlias: p.alias ?? "", ownerJustification: p.owner_justification ?? "", dedupKey: p.dedup_key ?? "", replyTo: p.reply_to ?? null });
+  const [res, err] = doSend(t, p.from ?? "", p.to, p.cc, rendered!, { fallbackAlias: p.alias ?? "", ownerJustification: p.owner_justification ?? "", dedupKey: p.dedup_key ?? "", replyTo: p.reply_to ?? null });
   if (err) return jz(c, err);
-  return c.json({ ...res, ...mailTaskHook(ctx, p.from ?? "", (p.to ?? []) as string[], p.template ?? "note", p.fields ?? {}) });
+  return c.json({ ...res, ...mailTaskHook(t, p.from ?? "", (p.to ?? []) as string[], p.template ?? "note", p.fields ?? {}) });
 });
-app.get("/api/poll", async (c) => { const box = c.req.query("box") ?? ""; if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(box)) return jz(c, { error: "bad_box" }); const msgs = await doPoll(ctx, box, Number(c.req.query("wait") ?? 25), true); return c.json({ messages: msgs }); });
-app.get("/api/checkmail", async (c) => { const box = c.req.query("box") ?? ""; if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(box)) return jz(c, { error: "bad_box" }); const at = Number(c.req.query("ack_through") ?? 0); if (at) doAck(ctx, box, at); const msgs = await doPoll(ctx, box, Number(c.req.query("wait") ?? 25), false); const rem = boardReminder(ctx, box); if (rem) msgs.push(rem); return c.json({ messages: msgs }); });
-app.post("/api/ack", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doAck(ctx, p.box ?? "", p.through_id)); });
-app.get("/api/peek", (c) => { const box = c.req.query("box") ?? ""; return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(box) ? c.json({ messages: fetchBox(ctx, box, false) }) : jz(c, { error: "bad_box" }); });
-app.get("/api/thread", (c) => jz(c, doThread(ctx, c.req.query("id") ?? "")));
-app.get("/api/history", (c) => { const box = c.req.query("box") ?? ""; return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(box) ? c.json(doHistory(ctx, box, Number(c.req.query("limit") ?? 50))) : jz(c, { error: "bad_box" }); });
-app.get("/api/boxes", (c) => c.json({ boxes: doBoxes(ctx) }));
+app.get("/api/poll", async (c) => { const t = T(c); const box = c.req.query("box") ?? ""; if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(box)) return jz(c, { error: "bad_box" }); const msgs = await doPoll(t, box, Number(c.req.query("wait") ?? 25), true); return c.json({ messages: msgs }); });
+app.get("/api/checkmail", async (c) => { const t = T(c); const box = c.req.query("box") ?? ""; if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(box)) return jz(c, { error: "bad_box" }); const at = Number(c.req.query("ack_through") ?? 0); if (at) doAck(t, box, at); const msgs = await doPoll(t, box, Number(c.req.query("wait") ?? 25), false); const rem = boardReminder(t, box); if (rem) msgs.push(rem); return c.json({ messages: msgs }); });
+app.post("/api/ack", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doAck(t, p.box ?? "", p.through_id)); });
+app.get("/api/peek", (c) => { const t = T(c); const box = c.req.query("box") ?? ""; return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(box) ? c.json({ messages: fetchBox(t, box, false) }) : jz(c, { error: "bad_box" }); });
+app.get("/api/thread", (c) => jz(c, doThread(T(c), c.req.query("id") ?? "")));
+app.get("/api/history", (c) => { const t = T(c); const box = c.req.query("box") ?? ""; return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(box) ? c.json(doHistory(t, box, Number(c.req.query("limit") ?? 50))) : jz(c, { error: "bad_box" }); });
+app.get("/api/boxes", (c) => c.json({ boxes: doBoxes(T(c)) }));
 
-app.post("/api/task/add", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doTaskAdd(ctx, p.team ?? "", p.title ?? "", p.detail ?? "", p.created_by ?? "", p.deps ?? null, p.assign_to ?? "", p.priority ?? 2, p.discovered_from ?? null)); });
-app.post("/api/task/claim", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doTaskClaim(ctx, Number(p.task_id), p.box ?? "")); });
-app.post("/api/task/progress", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doTaskProgress(ctx, Number(p.task_id), p.box ?? "", p.note ?? "")); });
-app.post("/api/task/done", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doTaskDone(ctx, Number(p.task_id), p.box ?? "", p.result ?? "")); });
-app.get("/api/tasks", (c) => { const team = c.req.query("team") ?? ""; if (!ctx.db.prepare("SELECT 1 FROM teams WHERE code=?").get(team)) return jz(c, { error: "no_such_team" }); return c.json({ team, board: boardText(ctx, team), roster: rosterText(ctx, team) }); });
+app.post("/api/task/add", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doTaskAdd(t, p.team ?? "", p.title ?? "", p.detail ?? "", p.created_by ?? "", p.deps ?? null, p.assign_to ?? "", p.priority ?? 2, p.discovered_from ?? null)); });
+app.post("/api/task/claim", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doTaskClaim(t, Number(p.task_id), p.box ?? "")); });
+app.post("/api/task/progress", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doTaskProgress(t, Number(p.task_id), p.box ?? "", p.note ?? "")); });
+app.post("/api/task/done", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, doTaskDone(t, Number(p.task_id), p.box ?? "", p.result ?? "")); });
+app.get("/api/tasks", (c) => { const t = T(c); const team = c.req.query("team") ?? ""; if (!t.db.prepare("SELECT 1 FROM teams WHERE code=?").get(team)) return jz(c, { error: "no_such_team" }); return c.json({ team, board: boardText(t, team), roster: rosterText(t, team) }); });
 
-app.post("/api/owner/setup", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, await setupOwner(ctx, p.full_name ?? "", p.alias ?? "", p.email ?? "")); });
-app.post("/api/owner/confirm", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, confirmOwner(ctx, !!p.override)); });
-app.post("/api/owner/mode", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setOwnerMode(ctx, p.mode ?? "", p.custom_rules ?? "", p.allow_senders ?? "", p.allow_direct ?? "", p.persistent ?? null)); });
+app.post("/api/owner/setup", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, await setupOwner(t, p.full_name ?? "", p.alias ?? "", p.email ?? "")); });
+app.post("/api/owner/confirm", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, confirmOwner(t, !!p.override)); });
+app.post("/api/owner/mode", async (c) => { const t = T(c); const p = await c.req.json().catch(() => ({})); return jz(c, setOwnerMode(t, p.mode ?? "", p.custom_rules ?? "", p.allow_senders ?? "", p.allow_direct ?? "", p.persistent ?? null)); });
 
-app.get("/api/viewkey", (c) => { const code = resolveViewKey(ctx, c.req.query("key") ?? ""); return code ? c.json({ team: code }) : jz(c, { error: "bad_key" }); });
+app.get("/api/viewkey", (c) => { const code = resolveViewKey(T(c), c.req.query("key") ?? ""); return code ? c.json({ team: code }) : jz(c, { error: "bad_key" }); });
 
-app.route("/", dashboardRoutes(ctx));
+app.route("/", dashboardRoutes(ctrl));
+if (cfg.mode === "cloud") app.route("/", adminRoutes(ctrl));
 
 const host = cfg.host;
 const port = cfg.port;

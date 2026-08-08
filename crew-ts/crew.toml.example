@@ -1,8 +1,10 @@
 # crew-relay configuration. Copy to crew.toml and edit. Env vars override.
 # ── deployment profile ──────────────────────────────────────────────────
 # local   : 127.0.0.1 only, no auth — sessions on THIS machine only
-# private : reachable (tunnel/LAN), OAuth or preset tokens, deployer-gated
-# cloud   : public, open OAuth registration (+ GitHub login on the web UI)
+# private : reachable (tunnel/LAN), OAuth or preset tokens, deployer-gated,
+#           ONE shared trust domain (everyone connected sees the same crew)
+# cloud   : public, invite-gated registration (+ GitHub login), and every account
+#           gets its OWN isolated database — no account sees another's data
 mode = "local"
 port = 8790
 # public_url is REQUIRED for private/cloud (OAuth callbacks need a stable https base)
@@ -36,6 +38,10 @@ default_owner_mode = "a"
 board_refresh_s = 10
 
 [auth]
-open_registration = false  # cloud: allow anyone to register a web account
-# static_tokens_env = "CREW_STATIC_TOKENS"   # private: preset bearer tokens
-# session_secret_env = "CREW_SESSION_SECRET"
+open_registration = false  # cloud: allow registration (still invite-gated below)
+# admin_emails: accounts with these emails are admins (mint invite codes, see
+# aggregate activity) AND may register without an invite (bootstrap). Also
+# settable via CREW_ADMIN_EMAILS (comma-separated).
+# admin_emails = ["you@example.com"]
+# static_tokens_env = "CREW_STATIC_TOKENS"   # private only: preset bearer tokens
+# session_secret_env = "CREW_SESSION_SECRET" # set a strong secret in prod

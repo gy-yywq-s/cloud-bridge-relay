@@ -67,6 +67,9 @@ export function fullMembers(c: Ctx, code: string): Member[] {
 
 export function teamRoster(c: Ctx, code: string, view = "full") {
   const t = c.db.prepare("SELECT * FROM teams WHERE code=?").get(code) as { name: string; rv: number; coordinator: string } | undefined;
+  // No such team in THIS (tenant) database → say so explicitly rather than
+  // returning an empty shell. Success-path callers pass a code that exists.
+  if (!t) return { error: "no_such_team" } as const;
   const members = fullMembers(c, code);
   if (view === "brief") {
     return {

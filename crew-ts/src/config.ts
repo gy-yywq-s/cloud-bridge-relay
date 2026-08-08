@@ -72,8 +72,11 @@ const ConfigSchema = z.object({
     static_tokens_env: z.string().default("CREW_STATIC_TOKENS"),
     // web session signing secret env
     session_secret_env: z.string().default("CREW_SESSION_SECRET"),
-    // cloud: allow open account registration on the web UI
+    // cloud: allow open account registration on the web UI (invite-gated)
     open_registration: z.boolean().default(false),
+    // cloud: accounts whose email is listed here are admins (invite codes +
+    // aggregate activity view). Set via CREW_ADMIN_EMAILS (comma-separated) too.
+    admin_emails: z.array(z.string()).default([]),
   }).default({}),
 
   templates: Templates.default({
@@ -101,6 +104,7 @@ export function loadConfig(): Config {
   if (process.env.PORT) cfg.port = Number(process.env.PORT); // platform-injected
   if (process.env.CREW_PUBLIC_URL) cfg.public_url = process.env.CREW_PUBLIC_URL;
   if (process.env.CREW_DATA_DIR) cfg.data_dir = process.env.CREW_DATA_DIR;
+  if (process.env.CREW_ADMIN_EMAILS) cfg.auth.admin_emails = process.env.CREW_ADMIN_EMAILS.split(",").map((s) => s.trim()).filter(Boolean);
 
   // derived defaults
   if (!cfg.host) cfg.host = cfg.mode === "local" ? "127.0.0.1" : "0.0.0.0";

@@ -1,24 +1,32 @@
 // Human dashboard: see status (teams, pools, boxes, boards) and run team/pool
-// operations (initialize, rename, roles, board view). Everything except
-// registration is available here. Session-guarded in private/cloud.
+// operations (initialize, rename, roles, board view). Session-guarded in
+// private/cloud. In cloud mode every query runs against the signed-in account's
+// OWN tenant database (tenantCtx), so one user never sees another's crew.
 import { Hono } from "hono";
 import type { Ctx } from "../core/context.js";
 import { page, esc } from "./theme.js";
-import { rosterText, boxRow } from "../core/context.js";
+import { rosterText } from "../core/context.js";
 import { doPool, doInitializeTeam, doSetTeamName, doSetBoxRole, teamRoster, fullMembers } from "../core/teams.js";
 import { boardText } from "../core/tasks.js";
 import { wizPending } from "../core/wizard.js";
-import { getSession } from "../auth/accounts.js";
+import { getSession, isAdmin } from "../auth/accounts.js";
+import { tenantCtx } from "../core/tenancy.js";
 
-export function dashboardRoutes(c: Ctx): Hono {
+export function dashboardRoutes(ctrl: Ctx): Hono {
   const app = new Hono();
-  const guard = async (ctx: import("hono").Context): Promise<boolean> => {
-    if (c.cfg.mode === "local") return true;
-    return (await getSession(c, ctx)) != null;
+  // Returns the tenant-scoped Ctx for the signed-in user, or null if not allowed.
+  const scope = async (ctx: import("hono").Context): Promise<Ctx | null> => {
+    if (ctrl.cfg.mode === "local") return ctrl;
+    const id = await getSession(ctrl, ctx);
+    if (id == null) return null;
+    return tenantCtx(ctrl, id);
   };
 
   app.get("/app", async (ctx) => {
-    if (!(await guard(ctx))) return ctx.redirect("/login");
+    const c = await scope(ctx);
+    if (!c) return ctx.redirect("/login");
+    const sess = ctrl.cfg.mode === "cloud" ? await getSession(ctrl, ctx) : null;
+    const adminLink = sess != null && isAdmin(ctrl, sess) ? `<a class="btn ghost small" href="/admin">admin</a>` : "";
     const teams = c.db.prepare("SELECT code,name,rv FROM teams ORDER BY created_ts DESC").all() as { code: string; name: string; rv: number }[];
     const pools = c.db.prepare("SELECT DISTINCT pool_code FROM boxes WHERE status='waiting' AND pool_code IS NOT NULL").all() as { pool_code: string }[];
     const boxes = c.db.prepare("SELECT * FROM boxes WHERE box NOT LIKE '__meta%' ORDER BY last_seen DESC").all() as never[];
@@ -45,7 +53,7 @@ export function dashboardRoutes(c: Ctx): Hono {
     }).join("") || `<tr><td colspan="5" class="muted">No sessions yet.</td></tr>`;
 
     return ctx.html(page(c.cfg, "Dashboard", `
-      <h1>Dashboard</h1>
+      <div class="row"><h1 class="grow">Dashboard</h1>${adminLink}${ctrl.cfg.mode !== "local" ? `<a class="btn ghost small" href="/logout">sign out</a>` : ""}</div>
       <p class="muted small">Live view of your crew. Registration happens from the sessions themselves; everything else you can drive here.</p>
       <div class="card"><h2 style="margin-top:0">Teams</h2><table><thead><tr><th>Team</th><th>Members</th><th>Setup</th></tr></thead><tbody>${teamRows}</tbody></table></div>
       <div class="card"><h2 style="margin-top:0">Waiting pools</h2><table><thead><tr><th>Pool</th><th>Waiting</th><th>Sessions</th><th></th></tr></thead><tbody>${poolRows}</tbody></table></div>
@@ -54,7 +62,8 @@ export function dashboardRoutes(c: Ctx): Hono {
   });
 
   app.get("/app/team/:code", async (ctx) => {
-    if (!(await guard(ctx))) return ctx.redirect("/login");
+    const c = await scope(ctx);
+    if (!c) return ctx.redirect("/login");
     const code = ctx.req.param("code");
     if (!c.db.prepare("SELECT 1 FROM teams WHERE code=?").get(code)) return ctx.notFound();
     const members = fullMembers(c, code);
@@ -79,19 +88,22 @@ export function dashboardRoutes(c: Ctx): Hono {
   });
 
   app.post("/app/pool/:code/init", async (ctx) => {
-    if (!(await guard(ctx))) return ctx.redirect("/login");
+    const c = await scope(ctx);
+    if (!c) return ctx.redirect("/login");
     const b = await ctx.req.parseBody();
     const r = doInitializeTeam(c, ctx.req.param("code"), String(b.coordinator || ""));
     return ctx.redirect("error" in r ? "/app" : `/app/team/${(r as { team_code: string }).team_code}`);
   });
   app.post("/app/team/:code/name", async (ctx) => {
-    if (!(await guard(ctx))) return ctx.redirect("/login");
+    const c = await scope(ctx);
+    if (!c) return ctx.redirect("/login");
     const b = await ctx.req.parseBody();
     doSetTeamName(c, ctx.req.param("code"), String(b.name || ""));
     return ctx.redirect(`/app/team/${ctx.req.param("code")}`);
   });
   app.post("/app/team/:code/role", async (ctx) => {
-    if (!(await guard(ctx))) return ctx.redirect("/login");
+    const c = await scope(ctx);
+    if (!c) return ctx.redirect("/login");
     const b = await ctx.req.parseBody();
     const [no, role] = String(b.set || "").split(":");
     if (no && role) doSetBoxRole(c, ctx.req.param("code"), Number(no), role);

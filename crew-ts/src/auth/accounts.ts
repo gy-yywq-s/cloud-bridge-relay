@@ -8,15 +8,41 @@ import type { Context } from "hono";
 import type { Ctx } from "../core/context.js";
 import { now } from "../db.js";
 
-interface Account { id: number; email: string; pw_hash: string | null; display: string }
+interface Account { id: number; email: string; pw_hash: string | null; display: string; is_admin: number }
 
-export async function createAccount(c: Ctx, email: string, password: string, display = ""): Promise<{ ok: true; id: number } | { error: string }> {
+// The configured admin allow-list is authoritative: an account is an admin iff
+// its email is on it. Applied at creation and reconciled at startup. Admins are
+// also pre-authorized to register without an invite (bootstrap: the first admin
+// must be able to sign in before any invite exists).
+export function isAdminEmail(c: Ctx, email: string): boolean {
+  return (c.cfg.auth.admin_emails || []).map((e) => e.trim().toLowerCase()).includes(email.trim().toLowerCase());
+}
+
+export function isAdmin(c: Ctx, accountId: number | null | undefined): boolean {
+  if (accountId == null) return false;
+  const r = c.db.prepare("SELECT is_admin FROM accounts WHERE id=?").get(accountId) as { is_admin: number } | undefined;
+  return !!r?.is_admin;
+}
+
+// Promote existing accounts whose email is on the admin list — but ONLY GitHub
+// accounts, whose email GitHub verified for us. A password account's email is
+// self-asserted and unverified, so it is never auto-promoted (that would let an
+// attacker claim the admin email by registering it). Operator bootstrap for
+// non-GitHub admins is the scripts/bootstrap-admin.mjs tool (direct DB access).
+export function reconcileAdmins(c: Ctx): void {
+  for (const e of c.cfg.auth.admin_emails || [])
+    c.db.prepare("UPDATE accounts SET is_admin=1 WHERE github_id IS NOT NULL AND lower(email)=?").run(e.trim().toLowerCase());
+}
+
+export async function createAccount(c: Ctx, email: string, password: string, display = "", isAdmin = 0): Promise<{ ok: true; id: number } | { error: string }> {
   email = email.trim().toLowerCase();
   if (!email.includes("@")) return { error: "a real email is required" };
   if (password.length < 8) return { error: "password must be at least 8 characters" };
   if (c.db.prepare("SELECT 1 FROM accounts WHERE email=?").get(email)) return { error: "an account with that email already exists" };
   const pw = await hash(password);
-  const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,display,created_ts) VALUES(?,?,?,?)").run(email, pw, display || email.split("@")[0], now());
+  // is_admin is caller-supplied (0 for web signup) — NEVER derived from the
+  // unverified submitted email. Only proven paths (GitHub, bootstrap) set it.
+  const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,is_admin,display,created_ts) VALUES(?,?,?,?,?)").run(email, pw, isAdmin ? 1 : 0, display || email.split("@")[0], now());
   return { ok: true, id: Number(info.lastInsertRowid) };
 }
 
@@ -26,13 +52,33 @@ export async function verifyAccount(c: Ctx, email: string, password: string): Pr
   try { return (await verify(a.pw_hash, password)) ? a.id : null; } catch { return null; }
 }
 
-export function upsertGithubAccount(c: Ctx, ghLogin: string, ghId: number, display: string): number {
-  const email = `gh_${ghId}@github`;
-  const existing = c.db.prepare("SELECT id FROM accounts WHERE email=?").get(email) as { id: number } | undefined;
-  if (existing) return existing.id;
-  // pw_hash NULL, never a guessable sentinel — password login is impossible for GitHub accounts.
-  const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,display,created_ts) VALUES(?,NULL,?,?)")
-    .run(email, display || ghLogin, now());
+// GitHub identity is keyed by the immutable numeric id (login/email can change).
+// The real verified email is stored when available so the admin allow-list can
+// match it; otherwise a non-guessable synthetic address is used. pw_hash stays
+// NULL so password login is impossible for GitHub accounts.
+export function upsertGithubAccount(c: Ctx, ghLogin: string, ghId: number, display: string, realEmail?: string | null): number {
+  const existing = c.db.prepare("SELECT id FROM accounts WHERE github_id=?").get(ghId) as { id: number } | undefined;
+  const email = (realEmail && realEmail.includes("@")) ? realEmail.trim().toLowerCase() : `gh_${ghId}@github`;
+  const admin = isAdminEmail(c, email) ? 1 : 0;
+  if (existing) {
+    // keep email/admin current in case the allow-list changed — but never let a
+    // collision with another account's email throw and lock this user out.
+    if (realEmail && realEmail.includes("@")) {
+      const taken = c.db.prepare("SELECT 1 FROM accounts WHERE email=? AND id!=?").get(email, existing.id);
+      if (!taken) c.db.prepare("UPDATE accounts SET email=?, is_admin=? WHERE id=?").run(email, admin, existing.id);
+    }
+    if (admin) c.db.prepare("UPDATE accounts SET is_admin=1 WHERE id=?").run(existing.id);
+    return existing.id;
+  }
+  // If that verified email is already held by some other account, don't collide
+  // (which would throw and block this GitHub user from registering) — fall back
+  // to the synthetic, non-guessable address. Admin is only granted when we can
+  // actually store the proven email, so a squatter can't deny admin either.
+  const collision = c.db.prepare("SELECT 1 FROM accounts WHERE email=?").get(email);
+  const useEmail = collision ? `gh_${ghId}@github` : email;
+  const useAdmin = collision ? 0 : admin;
+  const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,github_id,is_admin,display,created_ts) VALUES(?,NULL,?,?,?,?)")
+    .run(useEmail, ghId, useAdmin, display || ghLogin, now());
   return Number(info.lastInsertRowid);
 }
 
@@ -61,7 +107,12 @@ export async function getSession(c: Ctx, ctx: Context): Promise<number | null> {
 export function clearSession(ctx: Context): void { deleteCookie(ctx, "crew_session", { path: "/" }); }
 
 // private-mode deployer: one shared password (env) → synthetic account id -1.
-export function deployerPassword(c: Ctx): string | null { return process.env.CREW_DEPLOYER_PASSWORD || null; }
+// Meaningless under cloud multi-tenancy (id -1 owns no tenant database), so it
+// is disabled there — cloud users authenticate as real, isolated accounts.
+export function deployerPassword(c: Ctx): string | null {
+  if (c.cfg.mode === "cloud") return null;
+  return process.env.CREW_DEPLOYER_PASSWORD || null;
+}
 
 // ── GitHub (arctic) ───────────────────────────────────────────────────────
 export function github(c: Ctx): GitHub | null {

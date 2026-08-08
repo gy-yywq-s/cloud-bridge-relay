@@ -33,6 +33,13 @@ export function staleSweep(c: Ctx): void {
   }
 }
 
-export function startSweeps(c: Ctx): void {
-  setInterval(() => { try { staleSweep(c); } catch { /* noop */ } try { taskStallSweep(c); } catch { /* noop */ } }, c.cfg.timers.sweep_interval_s * 1000).unref();
+// `tenants()` yields the Ctx set to sweep each tick: one per account in cloud
+// mode (each its own database), or just the shared Ctx otherwise.
+export function startSweeps(ctrl: Ctx, tenants: () => Ctx[]): void {
+  setInterval(() => {
+    for (const c of tenants()) {
+      try { staleSweep(c); } catch { /* noop */ }
+      try { taskStallSweep(c); } catch { /* noop */ }
+    }
+  }, ctrl.cfg.timers.sweep_interval_s * 1000).unref();
 }
