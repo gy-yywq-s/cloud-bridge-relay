@@ -15,6 +15,8 @@ import { provider as makeProvider } from "./auth/store.js";
 import { authRoutes } from "./auth/web.js";
 import { dashboardRoutes } from "./web/app.js";
 import { adminRoutes } from "./web/admin.js";
+import { settingsRoutes } from "./web/settings.js";
+import { loadBrand } from "./web/brand.js";
 import { reconcileAdmins } from "./auth/accounts.js";
 import { loadConfig } from "./config.js";
 import { openDb } from "./db.js";
@@ -37,6 +39,7 @@ const cfg = loadConfig();
 const db = openDb(cfg);
 const ctrl: Ctx = { db, cfg, email: makeEmail(cfg) };
 reconcileAdmins(ctrl);
+loadBrand(ctrl);
 startSweeps(ctrl, () => (cfg.mode === "cloud" ? listTenantIds(ctrl).map((id) => tenantCtx(ctrl, id)) : [ctrl]));
 
 // A rejected promise or thrown timer must never take the relay down.
@@ -147,6 +150,7 @@ app.post("/api/owner/mode", async (c) => { const t = T(c); const p = await c.req
 app.get("/api/viewkey", (c) => { const code = resolveViewKey(T(c), c.req.query("key") ?? ""); return code ? c.json({ team: code }) : jz(c, { error: "bad_key" }); });
 
 app.route("/", dashboardRoutes(ctrl));
+app.route("/", settingsRoutes(ctrl));
 if (cfg.mode === "cloud") app.route("/", adminRoutes(ctrl));
 
 const host = cfg.host;

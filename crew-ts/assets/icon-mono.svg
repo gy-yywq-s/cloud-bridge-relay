@@ -1,7 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
-  <title id="title">crew mark</title>
-  <path fill="#1c4f8f" d="M104 150 214 256 104 362l-34-36 72-70-72-70z"/>
-  <rect x="238" y="164" width="176" height="48" rx="24" fill="#1c4f8f"/>
-  <rect x="238" y="236" width="128" height="48" rx="24" fill="#1c4f8f"/>
-  <rect x="326" y="320" width="88" height="40" rx="20" fill="#1c4f8f"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t"><title id="t">crew mark</title>
+  <path fill="#2563eb" d="M104 150 214 256 104 362l-34-36 72-70-72-70z"/>
+  <rect x="238" y="164" width="176" height="48" rx="24" fill="#2563eb"/>
+  <rect x="238" y="236" width="128" height="48" rx="24" fill="#2563eb"/>
+  <rect x="326" y="320" width="88" height="40" rx="20" fill="#2563eb"/>
 </svg>

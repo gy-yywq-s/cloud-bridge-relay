@@ -82,6 +82,8 @@ function migrateControl(db: DB): void {
       max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0,
       created_by INTEGER, disabled INTEGER NOT NULL DEFAULT 0,
       expires_ts TEXT, created_ts TEXT NOT NULL);
+    -- instance settings editable from the web UI (brand name, accent colour, …)
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
   // Upgrades: an accounts table created before these columns existed.
   addColumn(db, "accounts", "github_id", "INTEGER");

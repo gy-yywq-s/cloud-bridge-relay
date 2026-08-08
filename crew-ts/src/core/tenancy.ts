@@ -3,8 +3,10 @@
 // domain and every request shares the control database. tenantCtx() is the ONE
 // place that decides which database a request's core operations run against — so
 // data isolation is structural, not a filter that a query could forget.
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import type { DB } from "../db.js";
-import { openTenantDb } from "../db.js";
+import { openTenantDb, dataDir } from "../db.js";
 import type { Ctx } from "./context.js";
 
 // Bounded LRU of open tenant handles: a hot working set stays open, cold ones are
@@ -45,4 +47,13 @@ export function tenantCtx(ctrl: Ctx, accountId: number | null | undefined): Ctx 
 // Every account that could hold tenant data (for sweeps + admin metrics).
 export function listTenantIds(ctrl: Ctx): number[] {
   return (ctrl.db.prepare("SELECT id FROM accounts ORDER BY id").all() as { id: number }[]).map((r) => r.id);
+}
+
+// Permanently remove a tenant's isolated database (account deletion, cloud mode).
+export function dropTenant(ctrl: Ctx, accountId: number): void {
+  if (ctrl.cfg.mode !== "cloud" || accountId < 1) return;
+  const cached = cache.get(accountId);
+  if (cached) { try { cached.close(); } catch { /* noop */ } cache.delete(accountId); }
+  const dir = join(dataDir(ctrl.cfg), "tenants", String(accountId));
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* noop */ }
 }

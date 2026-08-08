@@ -11,6 +11,7 @@ import { generateState } from "arctic";
 import type { Ctx } from "../core/context.js";
 import { randHex } from "../core/context.js";
 import { authPage, esc } from "../web/theme.js";
+import { githubMark } from "../web/icons.js";
 import {
   createAccount, verifyAccount, upsertGithubAccount, setSession, getSession,
   deployerPassword, github, clearSession, isAdminEmail,
@@ -31,7 +32,7 @@ async function afterAuth(c: Ctx, ctx: import("hono").Context, accountId: number,
 }
 
 const errPage = (c: Ctx, title: string, msg: string, back = "/login") =>
-  authPage(c.cfg, title, `<div class="card"><h1>${esc(title)}</h1><p class="err">${esc(msg)}</p><p class="altlink"><a href="${esc(back)}">Back</a></p></div>`);
+  authPage(title, `<div class="card"><h1>${esc(title)}</h1><p class="err">${esc(msg)}</p><p class="altlink"><a href="${esc(back)}">Back</a></p></div>`);
 
 function consentPage(c: Ctx, ctx: import("hono").Context, pid: string, state: string): string {
   const p = c.db.prepare("SELECT client_id, redirect_uri FROM oauth_pending WHERE pid=?").get(pid) as { client_id: string; redirect_uri: string } | undefined;
@@ -41,7 +42,7 @@ function consentPage(c: Ctx, ctx: import("hono").Context, pid: string, state: st
   const who = cl?.name ? esc(cl.name) : "An application";
   let dest = "";
   try { dest = p ? new URL(p.redirect_uri).host : ""; } catch { dest = p?.redirect_uri || ""; }
-  return authPage(c.cfg, "Authorize", `
+  return authPage("Authorize", `
     <div class="card">
       <h1>Authorize access</h1>
       <p class="muted small">${who} wants to connect to your ${esc(c.cfg.brand.name)} account and act on your behalf.</p>
@@ -72,7 +73,7 @@ export function authRoutes(c: Ctx): Hono {
   const gh = github(c);
   const openReg = c.cfg.auth.open_registration;
   const ghAnchor = (authPid: string, state: string, id = "") =>
-    `<a ${id ? `id="${id}" ` : ""}class="btn gh" href="/auth/github${qs(authPid, state)}">Continue with GitHub</a>`;
+    `<a ${id ? `id="${id}" ` : ""}class="btn gh block" href="/auth/github${qs(authPid, state)}">${githubMark(17)}Continue with GitHub</a>`;
 
   // ── Sign in ───────────────────────────────────────────────────────────────
   app.get("/login", async (ctx) => {
@@ -82,7 +83,7 @@ export function authRoutes(c: Ctx): Hono {
     if (sess != null && authPid) return ctx.html(consentPage(c, ctx, authPid, state)); // approve waiting client
     if (sess != null) return ctx.redirect("/app");
     const dep = deployerPassword(c) ? `<p class="small muted" style="margin-top:12px">Deployer? Enter the deployer password as the password with any email.</p>` : "";
-    return ctx.html(authPage(c.cfg, authPid ? "Authorize a client" : "Sign in", `
+    return ctx.html(authPage(authPid ? "Authorize a client" : "Sign in", `
       <div class="card">
         <h1>Sign in</h1>
         ${authPid ? `<p class="muted small">An MCP client wants to connect to your ${esc(c.cfg.brand.name)} account.</p>` : `<p class="muted small">Welcome back.</p>`}
@@ -117,7 +118,7 @@ export function authRoutes(c: Ctx): Hono {
     const ghBlock = gh ? `<div class="sep"></div>${ghAnchor(authPid, state, "ghlink")}
       <p class="small muted" style="margin-top:8px">GitHub sign-up uses the invite code above too.</p>
       <script>(function(){var g=document.getElementById('ghlink'),f=document.getElementById('invitefield');if(g&&f)g.addEventListener('click',function(){var u=new URL(g.getAttribute('href'),location.origin);if(f.value)u.searchParams.set('invite',f.value.trim());g.setAttribute('href',u.pathname+u.search);});})();</script>` : "";
-    return ctx.html(authPage(c.cfg, "Create account", `
+    return ctx.html(authPage("Create account", `
       <div class="card">
         <h1>Create your account</h1>
         <p class="muted small">Registration is invite-only — enter your code to join.</p>

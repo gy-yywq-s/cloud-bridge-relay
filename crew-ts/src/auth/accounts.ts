@@ -6,6 +6,7 @@ import { sign, verify as jwtVerify } from "hono/jwt";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import type { Context } from "hono";
 import type { Ctx } from "../core/context.js";
+import { dropTenant } from "../core/tenancy.js";
 import { now } from "../db.js";
 
 interface Account { id: number; email: string; pw_hash: string | null; display: string; is_admin: number }
@@ -57,29 +58,39 @@ export async function verifyAccount(c: Ctx, email: string, password: string): Pr
 // match it; otherwise a non-guessable synthetic address is used. pw_hash stays
 // NULL so password login is impossible for GitHub accounts.
 export function upsertGithubAccount(c: Ctx, ghLogin: string, ghId: number, display: string, realEmail?: string | null): number {
-  const existing = c.db.prepare("SELECT id FROM accounts WHERE github_id=?").get(ghId) as { id: number } | undefined;
-  const email = (realEmail && realEmail.includes("@")) ? realEmail.trim().toLowerCase() : `gh_${ghId}@github`;
-  const admin = isAdminEmail(c, email) ? 1 : 0;
-  if (existing) {
-    // keep email/admin current in case the allow-list changed — but never let a
-    // collision with another account's email throw and lock this user out.
-    if (realEmail && realEmail.includes("@")) {
-      const taken = c.db.prepare("SELECT 1 FROM accounts WHERE email=? AND id!=?").get(email, existing.id);
-      if (!taken) c.db.prepare("UPDATE accounts SET email=?, is_admin=? WHERE id=?").run(email, admin, existing.id);
-    }
-    if (admin) c.db.prepare("UPDATE accounts SET is_admin=1 WHERE id=?").run(existing.id);
-    return existing.id;
+  // 1) Known GitHub identity → that account.
+  const byId = c.db.prepare("SELECT id FROM accounts WHERE github_id=?").get(ghId) as { id: number } | undefined;
+  const email = (realEmail && realEmail.includes("@")) ? realEmail.trim().toLowerCase() : null;
+  if (byId) {
+    if (email && isAdminEmail(c, email)) c.db.prepare("UPDATE accounts SET is_admin=1 WHERE id=?").run(byId.id);
+    return byId.id;
   }
-  // If that verified email is already held by some other account, don't collide
-  // (which would throw and block this GitHub user from registering) — fall back
-  // to the synthetic, non-guessable address. Admin is only granted when we can
-  // actually store the proven email, so a squatter can't deny admin either.
-  const collision = c.db.prepare("SELECT 1 FROM accounts WHERE email=?").get(email);
-  const useEmail = collision ? `gh_${ghId}@github` : email;
-  const useAdmin = collision ? 0 : admin;
+  // 2) LINK to an existing account with the same VERIFIED email (e.g. the user
+  //    first registered with email+password, now signs in with GitHub) — one
+  //    person, one account. No duplicate rows.
+  if (email) {
+    const byEmail = c.db.prepare("SELECT id FROM accounts WHERE email=?").get(email) as { id: number } | undefined;
+    if (byEmail) {
+      c.db.prepare("UPDATE accounts SET github_id=COALESCE(github_id,?) WHERE id=?").run(ghId, byEmail.id);
+      if (isAdminEmail(c, email)) c.db.prepare("UPDATE accounts SET is_admin=1 WHERE id=?").run(byEmail.id);
+      return byEmail.id;
+    }
+  }
+  // 3) New account. Store the verified email (enables admin match); else synthetic.
+  const storeEmail = email || `gh_${ghId}@github`;
+  const admin = email && isAdminEmail(c, email) ? 1 : 0;
   const info = c.db.prepare("INSERT INTO accounts(email,pw_hash,github_id,is_admin,display,created_ts) VALUES(?,NULL,?,?,?,?)")
-    .run(useEmail, ghId, useAdmin, display || ghLogin, now());
+    .run(storeEmail, ghId, admin, display || ghLogin, now());
   return Number(info.lastInsertRowid);
+}
+
+// Permanently delete an account: its control-plane rows and, in cloud mode, its
+// isolated tenant database. Irreversible.
+export function deleteAccount(ctrl: Ctx, id: number): void {
+  ctrl.db.prepare("DELETE FROM oauth_tokens WHERE account_id=?").run(id);
+  ctrl.db.prepare("DELETE FROM oauth_codes WHERE account_id=?").run(id);
+  ctrl.db.prepare("DELETE FROM accounts WHERE id=?").run(id);
+  dropTenant(ctrl, id);
 }
 
 // ── sessions (signed cookie) ──────────────────────────────────────────────
