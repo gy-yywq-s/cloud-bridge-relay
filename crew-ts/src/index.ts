@@ -17,7 +17,7 @@ import { startSweeps } from "./core/sweeps.js";
 import { buildMcpServer } from "./mcp/server.js";
 import {
   doRegister, doPool, doInitializeTeam, doJoinTeam, doSetTeamName,
-  doSetMemberAlias, doSetBoxRole, doBoxes, teamRoster,
+  doSetMemberAlias, doSetBoxRole, doBoxes, teamRoster, doAddMember,
 } from "./core/teams.js";
 import { renderTemplate, doSend, mailTaskHook, doPoll, fetchBox, doAck, boardReminder, doThread, doHistory } from "./core/mail.js";
 import { doTaskAdd, doTaskClaim, doTaskProgress, doTaskDone, boardText } from "./core/tasks.js";
@@ -82,6 +82,7 @@ app.post("/api/register", async (c) => { const p = await c.req.json().catch(() =
 app.get("/api/pool", (c) => jz(c, doPool(ctx, c.req.query("code") ?? "")));
 app.post("/api/team/create", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doInitializeTeam(ctx, p.pool_code ?? p.code ?? "", p.coordinator_box ?? "")); });
 app.post("/api/team/join", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doJoinTeam(ctx, p.code ?? "", p.box ?? "")); });
+app.post("/api/team/add-member", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, doAddMember(ctx, p.code ?? "", p.session_name ?? "", p.platform ?? "", p.environment ?? "", p.role ?? "", !!p.override_name)); });
 app.post("/api/team/name", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? doSetTeamName(ctx, p.code ?? "", p.name ?? "")); });
 app.post("/api/team/alias", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? doSetMemberAlias(ctx, p.code ?? "", Number(p.member_no), p.alias ?? "", !!p.override_name)); });
 app.post("/api/team/role", async (c) => { const p = await c.req.json().catch(() => ({})); return jz(c, setupGuard(ctx, p.code ?? "") ?? doSetBoxRole(ctx, p.code ?? "", Number(p.member_no), p.role ?? "")); });

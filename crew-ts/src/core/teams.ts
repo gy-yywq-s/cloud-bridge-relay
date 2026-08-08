@@ -114,6 +114,31 @@ export function doJoinTeam(c: Ctx, code: string, box: string) {
   return { ok: true, member_no: nxt, ...teamRoster(c, code) };
 }
 
+// Add a member to a team that already exists (post-setup). A fresh session
+// calls this with the TEAM ID directly — no pool round trip. Server mints the
+// box, attaches it, and the coordinator can then set its alias/role (setters
+// are unlocked once setup is done).
+export function doAddMember(c: Ctx, code: string, sessionName: string, platform: string, environment: string, role = "", overrideName = false) {
+  code = String(code);
+  if (!c.db.prepare("SELECT 1 FROM teams WHERE code=?").get(code)) return { error: "no_such_team" };
+  if (!PLATFORMS.includes(platform as never)) return { error: "bad_platform", detail: `one of ${JSON.stringify(PLATFORMS)}` };
+  if (role && !ROLES.includes(role as never)) return { error: "bad_role", detail: `one of ${JSON.stringify(ROLES)}` };
+  const clash = nameConflict(c, String(sessionName || ""), "");
+  if (clash && !overrideName)
+    return { error: "name_taken", conflict_with: clash, directive: `NAME COLLISION with box ${clash}. Tell the owner; retry with override_name=true only on their approval, or pick another name.` };
+  let box: string; do { box = "bx-" + randHex(3); } while (boxRow(c, box));
+  const nxt = ((c.db.prepare("SELECT MAX(member_no) m FROM boxes WHERE team_code=?").get(code) as { m: number | null }).m || 0) + 1;
+  touchBox(c, box, { session_name: String(sessionName || "").slice(0, 200), platform, env: String(environment || "").slice(0, 500), status: "teamed", role });
+  c.db.prepare("UPDATE boxes SET team_code=?, member_no=? WHERE box=?").run(code, nxt, box);
+  bumpRv(c, code);
+  broadcastTeam(c, code, `TEAM UPDATE: ${displayName(c, boxRow(c, box))} (box ${box}) joined as member #${nxt}, ${platform}.\n\n${teamCard(c, code)}`);
+  return {
+    ok: true, box, member_no: nxt,
+    say_to_owner: `Joined team ${code} as member #${nxt} (${box}). I am listening now.`,
+    directive: `YOUR BOX ID IS ${box} — SAVE IT. ENTER THE LISTENING LOOP: check_mail(${box}, wait_seconds=50) repeatedly. The coordinator can name you (set_member_alias) and set your role. Board discipline applies.`,
+  };
+}
+
 export function doSetTeamName(c: Ctx, code: string, name: string) {
   code = String(code);
   if (!c.db.prepare("SELECT 1 FROM teams WHERE code=?").get(code)) return { error: "no_such_team" };

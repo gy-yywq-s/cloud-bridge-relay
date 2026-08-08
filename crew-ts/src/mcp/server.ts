@@ -6,7 +6,7 @@ import type { Ctx } from "../core/context.js";
 import { OWNER_BOX, resolveViewKey, teamViewKey, rosterText, RELAY_RULE } from "../core/context.js";
 import {
   doRegister, doPool, doInitializeTeam, doJoinTeam, doSetTeamName,
-  doSetMemberAlias, doSetBoxRole, doBoxes, teamRoster, nameConflict,
+  doSetMemberAlias, doSetBoxRole, doBoxes, teamRoster, doAddMember,
 } from "../core/teams.js";
 import {
   renderTemplate, doSend, mailTaskHook, doPoll, fetchBox, doAck,
@@ -24,6 +24,30 @@ const WRi = { readOnlyHint: false, destructiveHint: false, idempotentHint: true,
 function findTeamByPool(c: Ctx, pool: string): string | null {
   const r = c.db.prepare("SELECT code FROM teams WHERE pool_code=? ORDER BY created_ts DESC LIMIT 1").get(String(pool)) as { code: string } | undefined;
   return r?.code ?? null;
+}
+
+function spawnGuide(c: Ctx, code: string, pool: string): Record<string, unknown> {
+  if (!c.db.prepare("SELECT 1 FROM teams WHERE code=?").get(code)) return { error: "no_such_team" };
+  const t = c.db.prepare("SELECT pool_code FROM teams WHERE code=?").get(code) as { pool_code: string };
+  const pc = pool || t.pool_code;
+  const base = c.cfg.public_url || `http://localhost:${c.cfg.port}`;
+  return {
+    team: code, pool_code: pc,
+    prerequisites: [
+      "The human must have done one-time setup on each machine that will host a teammate: the platform CLI installed and logged in (claude / codex), and a crew credential available to spawned processes as CREW_TOKEN (or OAuth pre-authorized).",
+      "A session cannot spawn a session on a machine it has no access to — MCP only runs while a session runs. Cross-machine spawn therefore needs a crew-agent daemon already running on the target box (see cross_machine).",
+    ],
+    same_machine: {
+      claude_code: `Use your native spawn (Task/agent tool or \`claude -p\`). Give each teammate the prompt: "connect crew MCP at ${base}/mcp, then crew_add_member(code='${code}', platform='claude-code', environment=<gather real facts>). Then enter the check_mail loop." Permissions/model/cwd are set by YOUR native spawn call, not by crew.`,
+      codex: `Launch \`codex exec\` (or the sidecar) with the same instruction and platform='codex'. Model/sandbox/cwd are codex launch flags.`,
+    },
+    cross_machine: {
+      what: "Run the crew-agent daemon (crew-ts/agent/crew-agent.ts) on each remote box the human prepared. It authenticates to crew and launches a local session on request.",
+      request: "Once daemons are running, tell the human which machines to spawn on; the daemon on each launches a session that calls crew_add_member itself.",
+    },
+    directive: "Present the prerequisites to the human plainly (they involve one-time manual setup you cannot do for them). Then use same_machine for local teammates; only rely on cross_machine where a daemon is confirmed running.",
+    relay_rule: RELAY_RULE,
+  };
 }
 
 export function buildMcpServer(c: Ctx): McpServer {
@@ -65,6 +89,10 @@ export function buildMcpServer(c: Ctx): McpServer {
     async ({ pool_code, coordinator_box }) => J(doInitializeTeam(c, pool_code, coordinator_box)));
   s.registerTool("join_team", { description: "Join an existing team late (register_box first). Broadcasts the update.", inputSchema: { code: z.string(), box: z.string() }, annotations: WRi },
     async ({ code, box }) => J(doJoinTeam(c, code, box)));
+  s.registerTool("crew_add_member", { description: "Join an ALREADY-SET-UP team directly by its team id (no pool round-trip). Gather real platform/environment facts first (as in onboard). Server mints your box id; the coordinator can then name you and set your role. Then enter the check_mail listening loop.", inputSchema: { code: z.string(), platform: z.string(), environment: z.string(), session_name: z.string().default(""), role: z.string().default(""), override_name: z.boolean().default(false) }, annotations: WRi },
+    async ({ code, platform, environment, session_name, role, override_name }) => J(doAddMember(c, code, session_name, platform, environment, role, override_name)));
+  s.registerTool("spawn_guide", { description: "How to bring MORE teammates online. Returns the exact recipe for THIS coordinator's situation: same-machine spawn (native Task/agent or `codex exec`) vs cross-machine (a crew-agent daemon the human must pre-run on the target box). crew never owns permissions/workspace/model — those stay with the native spawn.", inputSchema: { code: z.string(), pool_code: z.string().default("") }, annotations: RO },
+    async ({ code, pool_code }) => J(spawnGuide(c, String(code), String(pool_code))));
   s.registerTool("register_box", { description: "Low-level register into a pool. platform 'claude-code'|'codex'; box_id omitted first time (server assigns bx-xxxxxx; SAVE it), passed to re-register.", inputSchema: { platform: z.string(), environment: z.string(), pool_code: z.string(), session_name: z.string().default(""), box_id: z.string().default(""), role: z.string().default(""), override_name: z.boolean().default(false) }, annotations: WRi },
     async ({ platform, environment, pool_code, session_name, box_id, role, override_name }) => J(doRegister(c, box_id, session_name, platform, environment, pool_code, role, override_name)));
   s.registerTool("set_team_name", { description: "Setup center: set the team name (locked until the interview finishes).", inputSchema: { code: z.string(), name: z.string() }, annotations: WRi },
